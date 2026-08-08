@@ -5,10 +5,13 @@ import Toolbar from './components/Toolbar';
 import MediaLibrary from './components/MediaLibrary';
 import PreviewCanvas from './components/PreviewCanvas';
 import ScriptEditor from './components/ScriptEditor';
+import LongFormInspector from './components/LongFormInspector';
+import StartupModal from './components/StartupModal';
 import Timeline from './components/Timeline';
 import ExportModal from './components/ExportModal';
 import ToastContainer from './components/ToastContainer';
 import AutomationConsole from './components/AutomationConsole';
+import { uid } from './utils/fileHelpers';
 
 function AppContent() {
   const { state, actions } = useProject();
@@ -24,6 +27,12 @@ function AppContent() {
   const [vbsStep, setVbsStep] = useState('');
   const vbsAbortRef = useRef(null);
   const resizingRef = useRef(null);
+
+  // Latest-state ref for long-lived IPC listeners (never stale closures)
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   // ─── Panel Resizing ───
   const handleResizeStart = useCallback((e, panel) => {
@@ -84,6 +93,9 @@ function AppContent() {
         activeEl &&
         (activeEl.tagName === 'INPUT' ||
           activeEl.tagName === 'TEXTAREA' ||
+          activeEl.tagName === 'BUTTON' ||
+          activeEl.tagName === 'SELECT' ||
+          activeEl.tagName === 'A' ||
           activeEl.hasAttribute('contenteditable'))
       ) {
         return;
@@ -146,7 +158,7 @@ function AppContent() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [actions, state.isPlaying, state.selectedClipId, state.tracks, state.currentTime, setConsoleOpen, isVbsRunning]);
+  }, [actions, state.isPlaying, state.selectedClipId, state.tracks, state.currentTime, setConsoleOpen]);
 
   useEffect(() => {
     if (window.electronAPI && window.electronAPI.onTimelineVoicesUpdated) {
@@ -161,6 +173,7 @@ function AppContent() {
 
         if (payload.isRedo && voices.length > 0) {
           const { audioPath, characterName, blockId, characterId, duration, words } = voices[0];
+          if (!audioPath) return;
           const name = audioPath.split(/[\\/]/).pop();
           
           let dataUrl = '';
@@ -178,14 +191,15 @@ function AppContent() {
 
           const resolvedDataUrl = dataUrl || `file:///${audioPath.replace(/\\/g, '/')}`;
 
-          // Find and replace old media item in media library
-          const oldMediaItem = state.mediaItems.find(m => m.blockId === payload.redoBlockId);
+          // Find and replace old media item in media library (read latest
+          // state through the ref — the listener closure predates new items)
+          const oldMediaItem = stateRef.current.mediaItems.find(m => m.blockId === payload.redoBlockId);
           if (oldMediaItem) {
             actions.removeMedia(oldMediaItem.id);
           }
 
           const newMediaItem = {
-            id: `media_${Date.now()}_redo_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_redo_${uid()}`,
             name: name,
             path: audioPath,
             ext: '.wav',
@@ -222,6 +236,7 @@ function AppContent() {
 
         for (let i = 0; i < voices.length; i++) {
           const { audioPath, characterName, blockId, characterId, duration, words } = voices[i];
+          if (!audioPath) continue;
           const name = audioPath.split(/[\\/]/).pop();
           
           let dataUrl = '';
@@ -242,7 +257,7 @@ function AppContent() {
           }
 
           const item = {
-            id: `media_${Date.now()}_${i}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_${i}_${uid()}`,
             name: name,
             path: audioPath,
             ext: '.wav',
@@ -279,7 +294,16 @@ function AppContent() {
           height: brollHeight !== undefined ? brollHeight : 25,
           aspectRatio: brollAspectRatio || 'custom'
         });
-        actions.addToast('Project settings updated', 'success');
+        actions.addToast('Updated project settings!', 'success');
+      });
+    }
+
+    if (window.electronAPI && window.electronAPI.onMediaItemAdded) {
+      window.electronAPI.onMediaItemAdded((item) => {
+        if (item) {
+          actions.addMedia(item);
+          actions.addToast(`Imported vector graphic "${item.name}" into Media Library!`, 'success');
+        }
       });
     }
 
@@ -289,6 +313,9 @@ function AppContent() {
       }
       if (window.electronAPI && window.electronAPI.removeProjectSettingsUpdated) {
         window.electronAPI.removeProjectSettingsUpdated();
+      }
+      if (window.electronAPI && window.electronAPI.removeMediaItemAdded) {
+        window.electronAPI.removeMediaItemAdded();
       }
     };
   }, [actions, state.mediaItems]);
@@ -416,13 +443,23 @@ function AppContent() {
               </div>
             ) : (
               <div className="workspace__right" style={{ width: rightWidth, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-                <ScriptEditor
-                  onMinimize={() => {
-                    setSavedRightWidth(rightWidth);
-                    setRightWidth(0);
-                    setRightMinimized(true);
-                  }}
-                />
+                {state.projectMode === 'longform' ? (
+                  <LongFormInspector
+                    onMinimize={() => {
+                      setSavedRightWidth(rightWidth);
+                      setRightWidth(0);
+                      setRightMinimized(true);
+                    }}
+                  />
+                ) : (
+                  <ScriptEditor
+                    onMinimize={() => {
+                      setSavedRightWidth(rightWidth);
+                      setRightWidth(0);
+                      setRightMinimized(true);
+                    }}
+                  />
+                )}
               </div>
             )}
           </div>
@@ -473,6 +510,7 @@ function AppContent() {
 
       <ExportModal />
       <ToastContainer />
+      {state.projectMode === null && <StartupModal />}
     </div>
   );
 }

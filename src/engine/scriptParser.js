@@ -47,24 +47,31 @@ export function parseScript(scriptText) {
     return { blocks: [], characters: [] };
   }
 
-  // Match **Name:** or **Name**: patterns
-  const blockRegex = /\*\*([^*]+?):\*\*\s*([\s\S]*?)(?=\*\*[^*]+?:\*\*|$)/g;
+  // Match **Name:** or **Name**: patterns (colon inside or after the stars)
+  const headerRegex = /\*\*([^*]+?)(?::\*\*|\*\*:)\s*/g;
+  const headerMatches = [];
+  let match;
+  while ((match = headerRegex.exec(scriptText)) !== null) {
+    headerMatches.push({ name: match[1].trim(), index: match.index, end: headerRegex.lastIndex });
+  }
+
   const blocks = [];
   const characterMap = new Map();
-  let match;
   let colorIndex = 0;
 
-  while ((match = blockRegex.exec(scriptText)) !== null) {
-    const characterName = match[1].trim();
-    const dialogueText = match[2].trim();
+  for (let i = 0; i < headerMatches.length; i++) {
+    const header = headerMatches[i];
+    const dialogueStart = header.end;
+    const dialogueEnd = i + 1 < headerMatches.length ? headerMatches[i + 1].index : scriptText.length;
+    const dialogueText = scriptText.substring(dialogueStart, dialogueEnd).trim();
 
     if (!dialogueText) continue;
 
     // Track unique characters
-    if (!characterMap.has(characterName.toLowerCase())) {
-      characterMap.set(characterName.toLowerCase(), {
-        id: `char_${characterName.toLowerCase().replace(/\s+/g, '_')}`,
-        name: characterName,
+    if (!characterMap.has(header.name.toLowerCase())) {
+      characterMap.set(header.name.toLowerCase(), {
+        id: `char_${header.name.toLowerCase().replace(/\s+/g, '_')}`,
+        name: header.name,
         color: TRACK_COLORS[colorIndex % TRACK_COLORS.length],
         asset: null, // PNG asset path
         colorIndex: colorIndex,
@@ -73,7 +80,7 @@ export function parseScript(scriptText) {
       colorIndex++;
     }
 
-    const character = characterMap.get(characterName.toLowerCase());
+    const character = characterMap.get(header.name.toLowerCase());
 
     blocks.push({
       id: `block_${blocks.length}`,
@@ -99,7 +106,7 @@ export function parseScript(scriptText) {
 
   // If no bold format found, try simple "Name:" format
   if (blocks.length === 0) {
-    const simpleRegex = /^([A-Z][a-zA-Z\s]+?):\s*(.*?)(?=^[A-Z][a-zA-Z\s]+?:|$)/gm;
+    const simpleRegex = /^([A-Z][A-Za-z0-9 \-']+?):\s*([\s\S]*?)(?=^[A-Z][A-Za-z0-9 \-']+?:|$)/gm;
     while ((match = simpleRegex.exec(scriptText)) !== null) {
       const characterName = match[1].trim();
       const dialogueText = match[2].trim();

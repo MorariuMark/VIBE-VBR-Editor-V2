@@ -24,7 +24,7 @@ export function alignWords(scriptWords, whisperWords) {
   for (let i = 1; i <= n; i++) {
     for (let j = 1; j <= m; j++) {
       const w1 = scriptWords[i - 1].toLowerCase().replace(/[^\w]/g, '');
-      const w2 = whisperWords[j - 1].text.toLowerCase().replace(/[^\w]/g, '');
+      const w2 = String(whisperWords[j - 1].text ?? whisperWords[j - 1].word ?? '').toLowerCase().replace(/[^\w]/g, '');
       
       const matchCost = (w1 === w2) ? 0 : 1;
 
@@ -206,7 +206,7 @@ export function calculateClipOpacity(clip, time) {
   return 0.0;
 }
 
-export function drawFrame(ctx, { state, time, width, height, loadedImages, videoElement, drawHandles, transparentBackground, transformMode, activeAxis }) {
+export function drawFrame(ctx, { state, time, width, height, loadedImages, videoElement, backgroundFrame, drawHandles, transparentBackground, transformMode, activeAxis }) {
   const scaleFactor = width / state.canvasWidth;
   const activeBlocks = getActiveBlocks(state.dialogueBlocks, time);
 
@@ -248,25 +248,47 @@ export function drawFrame(ctx, { state, time, width, height, loadedImages, video
       ctx.globalAlpha = calculateClipOpacity(activeClip, time);
 
       if (activeClip.type === 'video') {
-        const v = (videoElement && videoElement[activeClip.id]) || 
-                  (activeClip.id === 'clip_bg' && videoElement instanceof HTMLVideoElement ? videoElement : null);
-        if (v && v.readyState >= 2) {
+        // Pre-rendered background cache frame (ImageBitmap) wins over the
+        // live <video> element for the background clip only.
+        if (activeClip.id === 'clip_bg' && backgroundFrame && backgroundFrame.close) {
           const canvasRatio = width / height;
-          const videoRatio = v.videoWidth / v.videoHeight || (state.canvasWidth / state.canvasHeight);
-          
-          let sx = 0, sy = 0, sw = v.videoWidth, sh = v.videoHeight;
-          if (videoRatio > canvasRatio) {
+          const frameRatio = backgroundFrame.width / backgroundFrame.height || canvasRatio;
+
+          let sx = 0, sy = 0, sw = backgroundFrame.width, sh = backgroundFrame.height;
+          if (frameRatio > canvasRatio) {
             sw = sh * canvasRatio;
-            sx = (v.videoWidth - sw) / 2;
+            sx = (backgroundFrame.width - sw) / 2;
           } else {
             sh = sw / canvasRatio;
-            sy = (v.videoHeight - sh) / 2;
+            sy = (backgroundFrame.height - sh) / 2;
           }
-          
+
           try {
-            ctx.drawImage(v, sx, sy, sw, sh, 0, 0, width, height);
+            ctx.drawImage(backgroundFrame, sx, sy, sw, sh, 0, 0, width, height);
           } catch (e) {
-            ctx.drawImage(v, 0, 0, width, height);
+            ctx.drawImage(backgroundFrame, 0, 0, width, height);
+          }
+        } else {
+          const v = (videoElement && videoElement[activeClip.id]) || 
+                    (activeClip.id === 'clip_bg' && videoElement instanceof HTMLVideoElement ? videoElement : null);
+          if (v && v.readyState >= 2) {
+            const canvasRatio = width / height;
+            const videoRatio = v.videoWidth / v.videoHeight || (state.canvasWidth / state.canvasHeight);
+            
+            let sx = 0, sy = 0, sw = v.videoWidth, sh = v.videoHeight;
+            if (videoRatio > canvasRatio) {
+              sw = sh * canvasRatio;
+              sx = (v.videoWidth - sw) / 2;
+            } else {
+              sh = sw / canvasRatio;
+              sy = (v.videoHeight - sh) / 2;
+            }
+            
+            try {
+              ctx.drawImage(v, sx, sy, sw, sh, 0, 0, width, height);
+            } catch (e) {
+              ctx.drawImage(v, 0, 0, width, height);
+            }
           }
         }
       } else if (activeClip.type === 'image') {

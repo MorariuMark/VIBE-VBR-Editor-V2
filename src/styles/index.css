@@ -1177,6 +1177,9 @@ html, body, #root {
   font-weight: 500;
   color: var(--text-secondary);
   transition: all var(--duration-fast) ease;
+  position: sticky;
+  left: 0;
+  z-index: 10;
 }
 
 .timeline-track__header--dragover {

@@ -1,6 +1,7 @@
-import React, { useRef, useState, useCallback, useEffect } from 'react';
+import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import { useProject } from '../store/ProjectContext';
-import { formatTime } from '../utils/fileHelpers';
+import { formatTime, uid } from '../utils/fileHelpers';
+import HoverMenuItem from './HoverMenuItem';
 
 /**
  * Multi-track Timeline Panel
@@ -16,6 +17,20 @@ export default function Timeline() {
   const [dragOverTrackId, setDragOverTrackId] = useState(null);
   const [clipContextMenu, setClipContextMenu] = useState(null); // { x, y, clip, trackId }
   const [trackContextMenu, setTrackContextMenu] = useState(null); // { x, y, track }
+  
+  // Latest-state refs so the global drag listeners never read stale closures
+  const stateRef = useRef(state);
+  const dragOverTrackIdRef = useRef(null);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+  useEffect(() => {
+    dragOverTrackIdRef.current = dragOverTrackId;
+  }, [dragOverTrackId]);
+  const setDragOver = (id) => {
+    dragOverTrackIdRef.current = id;
+    setDragOverTrackId(id);
+  };
   
   const { tracks, pixelsPerSecond, currentTime, totalDuration, isPlaying } = state;
   
@@ -119,14 +134,15 @@ export default function Timeline() {
       }
 
       const newClip = {
-        id: `clip_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `clip_${Date.now()}_${uid()}`,
         name: item.name,
         startTime: adjustedStartTime,
         duration: adjustedDuration,
-        color: track.color || (track.type === 'video' ? '#444466' : track.type === 'audio' ? '#00e5ff' : track.type === 'broll' ? '#ffb74d' : '#ffd740'),
+        color: track.color || (track.type === 'video' ? '#444466' : track.type === 'audio' ? '#00e5ff' : track.type === 'broll' ? '#ffb74d' : '#ec4899'),
         path: item.path,
         dataUrl: item.dataUrl,
         type: item.type,
+        isVector: item.isVector || item.name.endsWith('.svg') || (item.dataUrl && item.dataUrl.includes('image/svg+xml')),
       };
 
       actions.addClipToTrack(track.id, newClip);
@@ -138,7 +154,7 @@ export default function Timeline() {
   };
 
   // ─── Ruler ticks ───
-  const generateRulerTicks = () => {
+  const rulerTicks = useMemo(() => {
     const ticks = [];
     let interval = 1;
     if (pixelsPerSecond < 20) interval = 5;
@@ -147,7 +163,7 @@ export default function Timeline() {
 
     for (let t = 0; t <= totalDuration; t += interval) {
       const x = t * pixelsPerSecond;
-      const isMajor = t % (interval * 2 === 0 ? 2 : Math.ceil(1 / interval)) === 0 || interval >= 1;
+      const isMajor = Math.abs(t) % (interval * 2) < 1e-6;
       ticks.push(
         <div
           key={t}
@@ -165,17 +181,40 @@ export default function Timeline() {
       );
     }
     return ticks;
-  };
+  }, [pixelsPerSecond, totalDuration]);
 
   // ─── Playhead position ───
   const playheadX = currentTime * pixelsPerSecond + trackHeaderWidth;
 
-  // ─── Click on ruler to seek ───
-  const handleRulerClick = (e) => {
+  const [isScrubbing, setIsScrubbing] = useState(false);
+
+  // ─── Click / Drag on ruler to seek playhead ───
+  const handleRulerPointerDown = (e) => {
+    e.preventDefault();
+    setIsScrubbing(true);
+    e.currentTarget.setPointerCapture(e.pointerId);
+    
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left - trackHeaderWidth;
     const time = Math.max(0, x / pixelsPerSecond);
     actions.setCurrentTime(time);
+  };
+
+  const handleRulerPointerMove = (e) => {
+    if (!isScrubbing) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left - trackHeaderWidth;
+    const time = Math.max(0, x / pixelsPerSecond);
+    actions.setCurrentTime(time);
+  };
+
+  const handleRulerPointerUp = (e) => {
+    if (isScrubbing) {
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch (err) {}
+      setIsScrubbing(false);
+    }
   };
 
   // ─── Clip dragging ───
@@ -225,15 +264,16 @@ export default function Timeline() {
   // ─── Global mouse move/up ───
   useEffect(() => {
     const handleMouseMove = (e) => {
+      const s = stateRef.current;
       if (draggingClip) {
         const dx = e.clientX - draggingClip.startX;
         const dt = dx / pixelsPerSecond;
         const newStartTime = Math.max(0, draggingClip.origStartTime + dt);
         
-        const clipTrack = state.tracks.find(t => t.id === draggingClip.trackId);
+        const clipTrack = s.tracks.find(t => t.id === draggingClip.trackId);
         if (clipTrack && clipTrack.type === 'character') {
           const blockId = draggingClip.clipId.replace('presence_', '');
-          const block = state.dialogueBlocks.find(b => b.id === blockId);
+          const block = s.dialogueBlocks.find(b => b.id === blockId);
           const isLocked = block ? !block.unlocked : true;
           if (isLocked) {
             actions.updateBlockTiming(blockId, newStartTime, undefined);
@@ -258,17 +298,17 @@ export default function Timeline() {
           if (trackRow) {
             const targetTrackId = trackRow.getAttribute('data-track-id');
             if (targetTrackId) {
-              const targetTrack = state.tracks.find(t => t.id === targetTrackId);
+              const targetTrack = s.tracks.find(t => t.id === targetTrackId);
               if (targetTrack && targetTrack.type === clipTrack.type) {
-                setDragOverTrackId(targetTrackId);
+                setDragOver(targetTrackId);
               } else {
-                setDragOverTrackId(null);
+                setDragOver(null);
               }
             } else {
-              setDragOverTrackId(null);
+              setDragOver(null);
             }
           } else {
-            setDragOverTrackId(null);
+            setDragOver(null);
           }
         }
       }
@@ -277,10 +317,10 @@ export default function Timeline() {
         const dx = e.clientX - resizingClip.startX;
         const dt = dx / pixelsPerSecond;
         
-        const clipTrack = state.tracks.find(t => t.id === resizingClip.trackId);
+        const clipTrack = s.tracks.find(t => t.id === resizingClip.trackId);
         if (clipTrack && clipTrack.type === 'character') {
           const blockId = resizingClip.clipId.replace('presence_', '');
-          const block = state.dialogueBlocks.find(b => b.id === blockId);
+          const block = s.dialogueBlocks.find(b => b.id === blockId);
           const isLocked = block ? !block.unlocked : true;
           if (isLocked) {
             if (resizingClip.side === 'right') {
@@ -337,12 +377,13 @@ export default function Timeline() {
     };
 
     const handleMouseUp = () => {
-      if (draggingClip && dragOverTrackId && dragOverTrackId !== draggingClip.trackId) {
-        actions.moveClipToTrack(draggingClip.clipId, draggingClip.trackId, dragOverTrackId);
+      const dropTarget = dragOverTrackIdRef.current;
+      if (draggingClip && dropTarget && dropTarget !== draggingClip.trackId) {
+        actions.moveClipToTrack(draggingClip.clipId, draggingClip.trackId, dropTarget);
       }
       setDraggingClip(null);
       setResizingClip(null);
-      setDragOverTrackId(null);
+      setDragOver(null);
       actions.endDragHistory();
     };
 
@@ -354,7 +395,15 @@ export default function Timeline() {
         window.removeEventListener('mouseup', handleMouseUp);
       };
     }
-  }, [draggingClip, resizingClip, pixelsPerSecond, dragOverTrackId]);
+  }, [draggingClip, resizingClip, pixelsPerSecond]);
+
+  // A clip is "dialogue" when it lives on a real character track; the id
+  // prefixes are unreliable (track_broll_1 / track_window_slideshow also
+  // start with 'track_').
+  const isCharacterTrack = (trackId) => {
+    const track = state.tracks.find(t => t.id === trackId);
+    return !!(track && track.type === 'character');
+  };
 
   const handleClipContextMenu = (e, clip, trackId) => {
     e.preventDefault();
@@ -411,8 +460,9 @@ export default function Timeline() {
     if (!clipContextMenu) return;
     const { clip, trackId } = clipContextMenu;
     
-    if (trackId.startsWith('track_') && !trackId.includes('bg') && !trackId.includes('audio')) {
-      const updatedBlocks = state.dialogueBlocks.filter(b => b.id !== clip.id);
+    if (isCharacterTrack(trackId) || trackId === 'track_captions') {
+      const blockId = clip.id.replace(/^(presence_|caption_)/, '');
+      const updatedBlocks = state.dialogueBlocks.filter(b => b.id !== blockId);
       actions.setBlocks(updatedBlocks);
       actions.addToast(`Deleted dialogue block`, 'success');
     } else {
@@ -427,8 +477,9 @@ export default function Timeline() {
     const { clip, trackId } = clipContextMenu;
     const newName = prompt("Enter new name for the clip:", clip.name);
     if (newName && newName.trim()) {
-      if (trackId.startsWith('track_') && !trackId.includes('bg') && !trackId.includes('audio')) {
-        actions.updateBlock(clip.id, { text: newName });
+      if (isCharacterTrack(trackId)) {
+        const blockId = clip.id.startsWith('presence_') ? clip.id.replace('presence_', '') : clip.id;
+        actions.updateBlock(blockId, { text: newName });
       } else {
         actions.updateClipProperties(trackId, clip.id, { name: newName });
       }
@@ -477,7 +528,7 @@ export default function Timeline() {
     const { clip, trackId } = clipContextMenu;
     setClipContextMenu(null);
 
-    const blockId = clip.blockId || (trackId.startsWith('track_') && !trackId.includes('bg') && !trackId.includes('audio') ? clip.id : null);
+    const blockId = clip.blockId || (isCharacterTrack(trackId) ? clip.id.replace('presence_', '') : null);
     if (!blockId) return;
 
     const block = state.dialogueBlocks.find(b => b.id === blockId);
@@ -839,10 +890,16 @@ export default function Timeline() {
       </div>
 
       {/* Ruler */}
-      <div className="timeline-ruler" onClick={handleRulerClick} style={{ cursor: 'pointer' }}>
+      <div
+        className="timeline-ruler"
+        onPointerDown={handleRulerPointerDown}
+        onPointerMove={handleRulerPointerMove}
+        onPointerUp={handleRulerPointerUp}
+        style={{ cursor: 'ew-resize', touchAction: 'none' }}
+      >
         <div style={{ width: `${trackHeaderWidth}px`, minWidth: `${trackHeaderWidth}px`, background: 'var(--surface-1)', borderRight: '1px solid var(--border-subtle)' }} />
         <div className="timeline-ruler__labels" style={{ width: `${timelineWidth}px` }}>
-          {generateRulerTicks()}
+          {rulerTicks}
         </div>
       </div>
       {/* Tracks */}
@@ -1026,7 +1083,7 @@ export default function Timeline() {
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          {(clipContextMenu.clip.blockId || (clipContextMenu.trackId.startsWith('track_') && !clipContextMenu.trackId.includes('bg') && !clipContextMenu.trackId.includes('audio'))) && (
+          {(clipContextMenu.clip.blockId || (isCharacterTrack(clipContextMenu.trackId) && clipContextMenu.clip.id.startsWith('presence_'))) && (
             <HoverMenuItem text="Redo Voice Line" onClick={handleRedoVoiceLine} />
           )}
           {(() => {
@@ -1038,12 +1095,8 @@ export default function Timeline() {
               blockId = clip.id.replace('presence_', '');
             } else if (trackId === 'track_captions') {
               blockId = clip.id.replace('caption_', '');
-            } else if (trackId.startsWith('track_') && !trackId.includes('bg') && !trackId.includes('audio')) {
-              if (clip.id.startsWith('presence_')) {
-                blockId = clip.id.replace('presence_', '');
-              } else {
-                blockId = clip.id;
-              }
+            } else if (isCharacterTrack(trackId) && clip.id && clip.id.startsWith('presence_')) {
+              blockId = clip.id.replace('presence_', '');
             }
             if (!blockId) return null;
             const block = state.dialogueBlocks.find(b => b.id === blockId);
@@ -1135,8 +1188,13 @@ function AudioWaveformCanvas({ audioBuffer, width, height, color }) {
     if (!canvas || !width || !height) return;
     const ctx = canvas.getContext('2d');
     
-    canvas.width = width;
+    // Browsers cap canvas backing store at ~32767px; long timelines exceed
+    // it. Draw at a capped resolution and scale the context instead.
+    const MAX_CANVAS_W = 32767;
+    const drawW = Math.min(width, MAX_CANVAS_W);
+    canvas.width = drawW;
     canvas.height = height;
+    ctx.scale(width / drawW, 1);
     ctx.clearRect(0, 0, width, height);
 
     if (!audioBuffer) {
@@ -1179,25 +1237,4 @@ function AudioWaveformCanvas({ audioBuffer, width, height, color }) {
   }, [audioBuffer, width, height, color]);
 
   return <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />;
-}
-
-function HoverMenuItem({ text, onClick, color }) {
-  const [hover, setHover] = useState(false);
-  return (
-    <div
-      style={{
-        padding: '8px 12px',
-        fontSize: '12px',
-        cursor: 'pointer',
-        color: color || '#e3e3e8',
-        background: hover ? 'rgba(255, 255, 255, 0.08)' : 'transparent',
-        transition: 'background 0.2s',
-      }}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onClick={onClick}
-    >
-      {text}
-    </div>
-  );
 }

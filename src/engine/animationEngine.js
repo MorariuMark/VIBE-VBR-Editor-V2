@@ -1,9 +1,4 @@
-/**
- * Animation Engine
- * 
- * Handles character PNG entrance, sustain, and exit animations
- * for the preview canvas rendering.
- */
+import { getEasedProgress, evaluateCatmullRomSpline } from './easingEngine';
 
 // Available animation presets
 export const ANIMATION_PRESETS = {
@@ -349,7 +344,8 @@ export function getAnimatedTransform(block, element, currentTime) {
  * Check if a character should be visible at the given time.
  */
 function isBlockActive(block, currentTime) {
-  return currentTime >= block.startTime && currentTime <= (block.startTime + block.duration);
+  // End boundary is exclusive so back-to-back blocks never overlap by a frame
+  return currentTime >= block.startTime && currentTime < (block.startTime + block.duration);
 }
 
 /**
@@ -361,6 +357,7 @@ export function getActiveBlocks(blocks, currentTime) {
 
 /**
  * Calculate the interpolated transform of a character based on its keyframes at a given time.
+ * Supports Linear, Smooth Spline Curve, Ease-In, Ease-Out, Ease-In-Out, Bounce, Back Overshoot, and Hold.
  */
 export function getInterpolatedKeyframeTransform(keyframes, time) {
   if (!keyframes || keyframes.length === 0) return null;
@@ -383,22 +380,53 @@ export function getInterpolatedKeyframeTransform(keyframes, time) {
   
   const kf1 = sorted[i];
   const kf2 = sorted[i+1];
-  const progress = (time - kf1.time) / (kf2.time - kf1.time);
   
+  const rawProgress = (time - kf1.time) / (kf2.time - kf1.time);
+  const easing = kf1.easing || 'linear';
+  
+  const p0 = sorted[Math.max(0, i - 1)];
+  const p3 = sorted[Math.min(sorted.length - 1, i + 2)];
+
   const lerp = (v1, v2, p) => v1 + (v2 - v1) * p;
+
+  const interpolateVal = (prop) => {
+    const val1 = kf1[prop] ?? 0;
+    const val2 = kf2[prop] ?? 0;
+
+    if (easing === 'smoothSpline') {
+      const val0 = p0[prop] ?? val1;
+      const val3 = p3[prop] ?? val2;
+      return evaluateCatmullRomSpline(val0, val1, val2, val3, rawProgress);
+    }
+
+    const easedP = getEasedProgress(easing, rawProgress);
+    return lerp(val1, val2, easedP);
+  };
+
+  // flipX/flipY default to 1 when not keyframed; interpolating -1..1 passes
+  // through 0, so `|| 1` must not snap it back to 1 mid-transition.
+  const interpolateFlip = (prop) => {
+    const val1 = kf1[prop] ?? 1;
+    const val2 = kf2[prop] ?? 1;
+    if (easing === 'smoothSpline') {
+      return evaluateCatmullRomSpline(val1, val2, val2, val2, rawProgress);
+    }
+    return lerp(val1, val2, getEasedProgress(easing, rawProgress));
+  };
   
   return {
     time,
-    x: lerp(kf1.x, kf2.x, progress),
-    y: lerp(kf1.y, kf2.y, progress),
-    scale: lerp(kf1.scale, kf2.scale, progress),
-    rotation: lerp(kf1.rotation ?? 0, kf2.rotation ?? 0, progress),
-    opacity: lerp(kf1.opacity ?? 1, kf2.opacity ?? 1, progress),
-    skewX: lerp(kf1.skewX ?? 0, kf2.skewX ?? 0, progress),
-    skewY: lerp(kf1.skewY ?? 0, kf2.skewY ?? 0, progress),
-    rotateX: lerp(kf1.rotateX ?? 0, kf2.rotateX ?? 0, progress),
-    rotateY: lerp(kf1.rotateY ?? 0, kf2.rotateY ?? 0, progress),
-    flipX: lerp(kf1.flipX ?? 1, kf2.flipX ?? 1, progress),
-    flipY: lerp(kf1.flipY ?? 1, kf2.flipY ?? 1, progress),
+    x: interpolateVal('x'),
+    y: interpolateVal('y'),
+    scale: interpolateVal('scale'),
+    rotation: interpolateVal('rotation'),
+    opacity: kf1.opacity !== undefined && kf2.opacity !== undefined ? interpolateVal('opacity') : 1,
+    skewX: interpolateVal('skewX'),
+    skewY: interpolateVal('skewY'),
+    rotateX: interpolateVal('rotateX'),
+    rotateY: interpolateVal('rotateY'),
+    flipX: interpolateFlip('flipX'),
+    flipY: interpolateFlip('flipY'),
+    easing,
   };
 }

@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
+import { uid } from '../utils/fileHelpers';
 import { useProject } from '../store/ProjectContext';
 import { drawFrame, getCaptionTextForTime } from '../engine/renderEngine';
 import { getAnimatedTransform, getActiveBlocks, getInterpolatedKeyframeTransform } from '../engine/animationEngine';
@@ -12,11 +13,11 @@ export default function PreviewCanvas() {
   const containerRef = useRef(null);
   const renderAnimFrameRef = useRef(null);
   const playbackAnimFrameRef = useRef(null);
+  const lastRenderSignatureRef = useRef(null);
   const audioElementsRef = useRef({});
   const videoElementsRef = useRef({});
   const playStartRef = useRef(null);
   const localTimeRef = useRef(0);
-  const lastDispatchRef = useRef(0);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [dragging, setDragging] = useState(null); // { type: 'move'|'resize', elementId, startX, startY, origTransform, cx, cy, origDist }
   const [transformMode, setTransformMode] = useState('standard'); // 'standard' | 'skew'
@@ -165,6 +166,14 @@ export default function PreviewCanvas() {
         videoEl.playsInline = true;
         videoEl.src = srcUrl;
         videoEl.datasetSrc = srcUrl;
+        // Invalidate the paused idle-gate once a frame actually arrives or a
+        // seek completes, so the canvas never shows a stale frame.
+        videoEl.addEventListener('seeked', () => {
+          lastRenderSignatureRef.current = null;
+        });
+        videoEl.addEventListener('loadeddata', () => {
+          lastRenderSignatureRef.current = null;
+        });
         videoEl.load();
         videoElementsRef.current[clip.id] = videoEl;
       }
@@ -236,6 +245,16 @@ export default function PreviewCanvas() {
     preRenderedFramesRef.current = [];
   }, [state.backgroundVideo]);
 
+  // Release GPU frames and media elements on unmount
+  useEffect(() => () => {
+    preRenderedFramesRef.current.forEach(f => {
+      if (f && f.close) f.close();
+    });
+    preRenderedFramesRef.current = [];
+    Object.values(audioElementsRef.current).forEach(a => { try { a.pause(); } catch (e) {} });
+    Object.values(videoElementsRef.current).forEach(v => { try { v.pause(); } catch (e) {} });
+  }, []);
+
   const handlePreRender = async () => {
     if (!state.backgroundVideo) {
       actions.addToast("No background video to pre-render!", "warning");
@@ -259,9 +278,14 @@ export default function PreviewCanvas() {
     const totalFrames = Math.ceil(duration * preRenderFps);
     const frames = [];
 
+    // Cache at the project's actual aspect ratio (capped size keeps memory low)
+    const projectRatio = state.canvasWidth / state.canvasHeight || 9 / 16;
+    const preW = Math.min(480, state.canvasWidth || 360);
+    const preH = Math.round(preW / projectRatio);
+
     const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = 360;
-    exportCanvas.height = 640;
+    exportCanvas.width = preW;
+    exportCanvas.height = preH;
     const exportCtx = exportCanvas.getContext('2d');
 
     setPreRenderProgress(0);
@@ -294,8 +318,8 @@ export default function PreviewCanvas() {
         const time = i / preRenderFps;
         await seekVideo(tempVideo, time % duration);
 
-        exportCtx.clearRect(0, 0, 360, 640);
-        const canvasRatio = 360 / 640;
+        exportCtx.clearRect(0, 0, preW, preH);
+        const canvasRatio = preW / preH;
         const videoRatio = tempVideo.videoWidth / tempVideo.videoHeight || canvasRatio;
 
         let sx = 0, sy = 0, sw = tempVideo.videoWidth, sh = tempVideo.videoHeight;
@@ -307,7 +331,7 @@ export default function PreviewCanvas() {
           sy = (tempVideo.videoHeight - sh) / 2;
         }
 
-        exportCtx.drawImage(tempVideo, sx, sy, sw, sh, 0, 0, 360, 640);
+        exportCtx.drawImage(tempVideo, sx, sy, sw, sh, 0, 0, preW, preH);
 
         const bitmap = await createImageBitmap(exportCanvas);
         frames.push(bitmap);
@@ -334,23 +358,75 @@ export default function PreviewCanvas() {
 
     const renderTime = state.isPlaying ? localTimeRef.current : state.currentTime;
 
+    // Idle gate: while paused and not dragging, skip the draw entirely when
+    // nothing render-relevant changed. Prevents a 100% CPU spin on a static
+    // canvas. During a drag the transform is applied live, so always draw.
+    if (!state.isPlaying && !dragging) {
+      const transforms = state.characterTransforms || {};
+      let transformSum = '';
+      for (const key in transforms) {
+        const v = transforms[key];
+        transformSum += key + ':';
+        transformSum += Math.round((v.x || 0) * 10) + ',';
+        transformSum += Math.round((v.y || 0) * 10) + ',';
+        transformSum += Math.round((v.scale || 1) * 10) + ',';
+        transformSum += Math.round((v.rotation || 0) * 10) + ';';
+      }
+      const blocks = state.dialogueBlocks || [];
+      let blocksSum = 0;
+      for (let i = 0; i < blocks.length; i++) {
+        blocksSum += Math.round(blocks[i].startTime * 100) + Math.round(blocks[i].duration * 100);
+      }
+
+      const sig = [
+        Math.round(renderTime * 1000),
+        transformMode,
+        hoveredAxis,
+        state.selectedElementId || '',
+        state.selectedClipId || '',
+        state.brollLayout || 'none',
+        state.brollX,
+        state.brollY,
+        state.brollWidth,
+        state.brollHeight,
+        state.brollAspectRatio,
+        state.windowSlideshowEnabled ? 1 : 0,
+        Object.keys(loadedImagesRef.current).length,
+        preRenderedFramesRef.current.length,
+        canvasSize.width,
+        canvasSize.height,
+        (state.characters || []).length,
+        blocks.length,
+        blocksSum,
+        transformSum,
+        state.backgroundVideo ? (state.backgroundVideo.path || state.backgroundVideo.dataUrl || '').length : 0,
+      ].join('|');
+      if (sig === lastRenderSignatureRef.current) return;
+      lastRenderSignatureRef.current = sig;
+    }
+
     let bgFrame = null;
     if (preRenderedFramesRef.current.length > 0) {
       const frameIdx = Math.floor(renderTime * preRenderFps);
       bgFrame = preRenderedFramesRef.current[frameIdx % preRenderedFramesRef.current.length];
     }
 
-    drawFrame(ctx, {
-      state,
-      time: renderTime,
-      width,
-      height,
-      loadedImages: loadedImagesRef.current,
-      videoElement: bgFrame || videoElementsRef.current,
-      drawHandles: true,
-      transformMode,
-      activeAxis: (dragging?.type === 'rotate3d' ? dragging.lockedAxis : hoveredAxis),
-    });
+    try {
+      drawFrame(ctx, {
+        state,
+        time: renderTime,
+        width,
+        height,
+        loadedImages: loadedImagesRef.current,
+        videoElement: videoElementsRef.current,
+        backgroundFrame: bgFrame,
+        drawHandles: true,
+        transformMode,
+        activeAxis: (dragging?.type === 'rotate3d' ? dragging.lockedAxis : hoveredAxis),
+      });
+    } catch (err) {
+      console.error('[drawFrame] frame render failed:', err);
+    }
   }, [state, canvasSize, transformMode, dragging, hoveredAxis]);
 
   // Animation loop
@@ -402,7 +478,6 @@ export default function PreviewCanvas() {
     }
 
     playStartRef.current = performance.now() - state.currentTime * 1000;
-    lastDispatchRef.current = performance.now();
 
     const tick = () => {
       if (!playStartRef.current) return;
@@ -524,7 +599,9 @@ export default function PreviewCanvas() {
     const ctx = canvas.getContext('2d');
     const scaleFactor = canvasSize.width / state.canvasWidth;
 
-    const activeBlocks = getActiveBlocks(state.dialogueBlocks, state.currentTime);
+    const renderTime = state.isPlaying ? localTimeRef.current : state.currentTime;
+    const activeBlocks = getActiveBlocks(state.dialogueBlocks, renderTime);
+    if (activeBlocks.length === 0) return;
 
     // Check if clicking on any keyframe diamond marker for the selected element in the viewport
     if (state.selectedElementId) {
@@ -627,7 +704,7 @@ export default function PreviewCanvas() {
           ctx.letterSpacing = `${style.letterSpacing ?? 2}px`;
           
           const wordsPerLine = style.wordsPerLine ?? 3;
-          let activeText = getCaptionTextForTime(block.text, block.startTime, block.duration, state.currentTime, wordsPerLine, block.words) || '';
+          let activeText = getCaptionTextForTime(block.text, block.startTime, block.duration, renderTime, wordsPerLine, block.words) || '';
           if (!activeText) {
             ctx.restore();
           } else {
@@ -1531,7 +1608,27 @@ export default function PreviewCanvas() {
                 actions.assignCharacterAsset(state.characters[0].id, item);
                 actions.addToast(`Assigned "${item.name}" to ${state.characters[0].name}`, 'success');
               } else {
-                actions.addToast('Parse a script first to create characters!', 'warning');
+                // Add to PIP/B-Roll Track as vector graphic overlay
+                let targetTrack = state.tracks.find(t => t.type === 'broll' || t.type === 'video');
+                if (!targetTrack) {
+                  actions.addTrack('broll', 'PIP Overlay Track');
+                  targetTrack = state.tracks[state.tracks.length - 1];
+                }
+                const newClip = {
+                  id: `clip_${Date.now()}_${uid()}`,
+                  name: item.name,
+                  startTime: state.currentTime,
+                  duration: 5,
+                  color: '#ec4899',
+                  path: item.path,
+                  dataUrl: item.dataUrl,
+                  type: 'image',
+                  isVector: true,
+                };
+                if (targetTrack) {
+                  actions.addClipToTrack(targetTrack.id, newClip);
+                  actions.addToast(`Added "${item.name}" overlay to canvas!`, 'success');
+                }
               }
             }
           } catch (err) {

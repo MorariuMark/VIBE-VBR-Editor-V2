@@ -1,12 +1,17 @@
-import React, { createContext, useContext, useReducer, useCallback } from 'react';
+import React, { createContext, useContext, useReducer, useRef } from 'react';
 import { parseScript, recalculateTimings, addCustomCharacter, DEFAULT_TEXT_STYLE, estimateDialogueDuration } from '../engine/scriptParser';
+import { matchImageToScript } from '../utils/scriptImageMatcher';
+import { buildLongFormTimeline } from '../engine/longFormParser';
+import { uid } from '../utils/fileHelpers';
 
 const ProjectContext = createContext(null);
 
-// ─── Initial State ───
+// â”€â”€â”€ Initial State â”€â”€â”€
 const initialState = {
   // Project metadata
   projectName: 'Untitled Project',
+  projectMode: null, // null (preset not chosen yet) | 'shortform' | 'longform'
+  presetMeta: {}, // { aspect, width, height, fps } chosen at startup
   
   // Media library
   mediaItems: [], // { id, name, type: 'video'|'audio'|'image', path, dataUrl, duration? }
@@ -29,8 +34,8 @@ const initialState = {
   characterTransforms: {}, // characterId -> { x, y, scale, rotation }
   
   // Preview
-  canvasWidth: 1080,
-  canvasHeight: 1920,
+  canvasWidth: 1920,
+  canvasHeight: 1080,
   selectedElementId: null,
   selectedKeyframeIndex: null,
   
@@ -53,8 +58,8 @@ const initialState = {
   isExporting: false,
   exportProgress: 0,
   exportSettings: {
-    width: 1080,
-    height: 1920,
+    width: 1920,
+    height: 1080,
     fps: 60,
     codec: 'libx264',
     crf: 18,
@@ -76,7 +81,7 @@ const initialState = {
   },
 };
 
-// ─── Action Types ───
+// â”€â”€â”€ Action Types â”€â”€â”€
 const ActionTypes = {
   SET_SCRIPT: 'SET_SCRIPT',
   PARSE_SCRIPT: 'PARSE_SCRIPT',
@@ -91,6 +96,11 @@ const ActionTypes = {
   ADD_MEDIA: 'ADD_MEDIA',
   REMOVE_MEDIA: 'REMOVE_MEDIA',
   RENAME_MEDIA: 'RENAME_MEDIA',
+  IMPORT_IMAGE_FOLDER: 'IMPORT_IMAGE_FOLDER',
+  APPLY_IMAGES_TO_TIMELINE: 'APPLY_IMAGES_TO_TIMELINE',
+  BUILD_LONG_FORM_TIMELINE: 'BUILD_LONG_FORM_TIMELINE',
+  SET_PROJECT_MODE: 'SET_PROJECT_MODE',
+  RESET_PROJECT: 'RESET_PROJECT',
   SET_AUDIO: 'SET_AUDIO',
   SET_AUDIO_BUFFER: 'SET_AUDIO_BUFFER',
   SET_BACKGROUND_VIDEO: 'SET_BACKGROUND_VIDEO',
@@ -99,7 +109,6 @@ const ActionTypes = {
   SET_CURRENT_TIME: 'SET_CURRENT_TIME',
   SET_PLAYING: 'SET_PLAYING',
   SET_PIXELS_PER_SECOND: 'SET_PIXELS_PER_SECOND',
-  SET_TOTAL_DURATION: 'SET_TOTAL_DURATION',
   SELECT_CLIP: 'SELECT_CLIP',
   
   SET_CHARACTER_TRANSFORM: 'SET_CHARACTER_TRANSFORM',
@@ -160,7 +169,120 @@ function recalculateTotalDuration(blocks) {
   return Math.max(1, lastBlock.startTime + lastBlock.duration + 0.3);
 }
 
-// ─── Core Reducer ───
+// Derive the project length from every clip end (except clip_bg, whose
+// duration tracks totalDuration itself). Used after clip mutations so the
+// timeline grows/shrinks with the clips on it.
+function computeProjectDuration(state) {
+  let maxEnd = 0;
+  (state.dialogueBlocks || []).forEach(b => {
+    maxEnd = Math.max(maxEnd, b.startTime + b.duration);
+  });
+  (state.tracks || []).forEach(t => {
+    (t.clips || []).forEach(c => {
+      if (c.id !== 'clip_bg') {
+        maxEnd = Math.max(maxEnd, c.startTime + c.duration);
+      }
+    });
+  });
+  return maxEnd;
+}
+
+// Match image names against the dialogue blocks (naming convention), resolve
+// overlaps, and place them on a video track that does not hold clip_bg.
+// Extends totalDuration and the default background clip when needed.
+// Shared by IMPORT_IMAGE_FOLDER and APPLY_IMAGES_TO_TIMELINE.
+function placeImageClips(state, items) {
+  const clipDuration = 5;
+  const blocks = state.dialogueBlocks || [];
+  const MIN_CLIP_DURATION = 0.5;
+
+  const matched = [];
+  const unmatched = [];
+  items.forEach(item => {
+    const match = blocks.length > 0 ? matchImageToScript(item.name, blocks) : null;
+    if (match && match.endTime - match.startTime >= MIN_CLIP_DURATION) {
+      matched.push({ item, match });
+    } else {
+      unmatched.push(item);
+    }
+  });
+
+  matched.sort((a, b) => a.match.startTime - b.match.startTime);
+  const resolvedClips = [];
+  let cursor = 0;
+  matched.forEach(m => {
+    const startTime = Math.max(m.match.startTime, cursor);
+    const rawDuration = m.match.endTime - startTime;
+    const duration = Math.max(rawDuration, MIN_CLIP_DURATION);
+    resolvedClips.push({
+      id: `clip_${Date.now()}_${uid()}`,
+      name: m.item.name,
+      startTime,
+      duration,
+      color: '#444466',
+      path: m.item.path,
+      dataUrl: m.item.dataUrl,
+      type: 'image',
+      scriptMatched: true,
+    });
+    cursor = startTime + duration;
+  });
+
+  const fallbackClips = unmatched.map((item, idx) => ({
+    id: `clip_${Date.now()}_${uid()}_${idx}`,
+    name: item.name,
+    startTime: cursor + idx * clipDuration,
+    duration: clipDuration,
+    color: '#444466',
+    path: item.path,
+    dataUrl: item.dataUrl,
+    type: 'image',
+  }));
+
+  const newClips = [...resolvedClips, ...fallbackClips];
+
+  let targetTrack = state.tracks.find(t =>
+    t.type === 'video' && !(t.clips || []).some(c => c.id === 'clip_bg' && c.isDefaultDuration)
+  );
+
+  let tracks = [...state.tracks];
+  if (targetTrack) {
+    tracks = tracks.map(t =>
+      t.id === targetTrack.id
+        ? { ...t, clips: [...t.clips, ...newClips].sort((a, b) => a.startTime - b.startTime) }
+        : t
+    );
+  } else {
+    tracks = [
+      ...tracks,
+      {
+        id: `track_slideshow_${Date.now()}`,
+        name: 'Slideshow',
+        type: 'video',
+        color: '#444466',
+        clips: newClips,
+      },
+    ];
+  }
+
+  const lastEnd = newClips.reduce((max, c) => Math.max(max, c.startTime + c.duration), 0);
+  const totalDuration = Math.max(state.totalDuration, lastEnd);
+
+  const syncedTracks = totalDuration > state.totalDuration
+    ? tracks.map(track => ({
+        ...track,
+        clips: (track.clips || []).map(clip =>
+          clip.id === 'clip_bg' && clip.isDefaultDuration
+            ? { ...clip, duration: totalDuration }
+            : clip
+        ),
+      }))
+    : tracks;
+
+  return { tracks: syncedTracks, totalDuration };
+}
+
+// â”€â”€â”€ Core Reducer â”€â”€â”€
 function coreProjectReducer(state, action) {
   switch (action.type) {
     case ActionTypes.SET_SCRIPT:
@@ -182,7 +304,9 @@ function coreProjectReducer(state, action) {
       }));
       
       const totalDuration = recalculateTotalDuration(blocks);
-      const tracks = generateTracksFromBlocks(blocks, mergedCharacters, { ...state, totalDuration, characterPresenceClips, tracks: [] });
+      // Preserve user tracks (broll, slideshow, extra video/audio) across a
+      // re-parse — only character/caption tracks are rebuilt from blocks.
+      const tracks = generateTracksFromBlocks(blocks, mergedCharacters, { ...state, totalDuration, characterPresenceClips, tracks: state.tracks });
       
       return {
         ...state,
@@ -199,8 +323,28 @@ function coreProjectReducer(state, action) {
         b.id === action.payload.id ? { ...b, ...action.payload.changes } : b
       );
       const totalDuration = recalculateTotalDuration(blocks);
-      const tracks = generateTracksFromBlocks(blocks, state.characters, { ...state, totalDuration });
-      return { ...state, dialogueBlocks: blocks, totalDuration, tracks };
+
+      // Keep the character track in sync when timing changes on a locked block
+      let characterPresenceClips = state.characterPresenceClips || [];
+      const changedBlock = action.payload.changes;
+      if (changedBlock && (changedBlock.startTime !== undefined || changedBlock.duration !== undefined)) {
+        const targetBlock = blocks.find(b => b.id === action.payload.id);
+        if (targetBlock && !targetBlock.unlocked) {
+          characterPresenceClips = characterPresenceClips.map(clip => {
+            if (clip.id === `presence_${action.payload.id}`) {
+              return {
+                ...clip,
+                startTime: targetBlock.startTime,
+                duration: targetBlock.duration,
+              };
+            }
+            return clip;
+          });
+        }
+      }
+
+      const tracks = generateTracksFromBlocks(blocks, state.characters, { ...state, totalDuration, characterPresenceClips });
+      return { ...state, dialogueBlocks: blocks, totalDuration, tracks, characterPresenceClips };
     }
     
     case ActionTypes.UPDATE_BLOCK_TIMING: {
@@ -245,6 +389,13 @@ function coreProjectReducer(state, action) {
             }
           }
           finalStartTime = bestStart;
+        } else {
+          // No gap fits: snap to the end of the last block so the drag
+          // never leaves the block overlapping or beyond the timeline.
+          const lastEnd = sortedOther.length > 0
+            ? Math.max(...sortedOther.map(b => b.startTime + b.duration))
+            : 0;
+          finalStartTime = Math.max(0, Math.min(lastEnd, startTime));
         }
       } else if (startTime !== undefined && duration !== undefined) {
         // Resizing left side
@@ -262,9 +413,12 @@ function coreProjectReducer(state, action) {
         const nextLimit = succeedingBlocks.length > 0
           ? Math.min(...succeedingBlocks.map(b => b.startTime))
           : state.totalDuration;
-        
+
         finalDuration = Math.max(0.2, Math.min(nextLimit - origStartTime, duration));
       }
+
+      // Never allow zero/negative durations regardless of path
+      finalDuration = Math.max(0.2, finalDuration);
 
       // Update blocks array
       const blocks = state.dialogueBlocks.map(b =>
@@ -296,10 +450,19 @@ function coreProjectReducer(state, action) {
     case ActionTypes.SET_BLOCKS: {
       const blocks = action.payload;
       const totalDuration = recalculateTotalDuration(blocks);
-      let characterPresenceClips = state.characterPresenceClips || [];
-      characterPresenceClips = characterPresenceClips.filter(clip => 
-        blocks.some(b => `presence_${b.id}` === clip.id || b.id === clip.id)
-      );
+      // Rebuild presence clips from blocks: keep any existing (possibly
+      // user-trimmed) clip, create defaults for new blocks, drop orphans.
+      const existingPresence = state.characterPresenceClips || [];
+      const presenceById = new Map(existingPresence.map(c => [c.id, c]));
+      const characterPresenceClips = blocks.map(b => {
+        const id = `presence_${b.id}`;
+        return presenceById.get(id) || {
+          id,
+          characterId: b.characterId,
+          startTime: b.startTime,
+          duration: b.duration,
+        };
+      });
       const tracks = generateTracksFromBlocks(blocks, state.characters, { ...state, totalDuration, characterPresenceClips });
       return { ...state, dialogueBlocks: blocks, totalDuration, tracks, characterPresenceClips };
     }
@@ -406,22 +569,34 @@ function coreProjectReducer(state, action) {
     
     case ActionTypes.ADD_CHARACTER: {
       const newChar = addCustomCharacter(state.characters, action.payload);
-      return { ...state, characters: [...state.characters, newChar] };
+      const characters = [...state.characters, newChar];
+      // Give the new character its own track immediately (no clips until parse)
+      const tracks = generateTracksFromBlocks(state.dialogueBlocks, characters, state);
+      return { ...state, characters, tracks };
     }
     
     case ActionTypes.UPDATE_CHARACTER: {
       const characters = state.characters.map(c =>
         c.id === action.payload.id ? { ...c, ...action.payload.changes } : c
       );
-      return { ...state, characters };
+      // Name/color changes must reflect on the character track header
+      const tracks = generateTracksFromBlocks(state.dialogueBlocks, characters, state);
+      return { ...state, characters, tracks };
     }
     
-    case ActionTypes.REMOVE_CHARACTER:
+    case ActionTypes.REMOVE_CHARACTER: {
+      const characters = state.characters.filter(c => c.id !== action.payload);
+      const characterPresenceClips = (state.characterPresenceClips || []).filter(c => c.characterId !== action.payload);
+      // Drop the stale character track along with the character
+      const tracks = generateTracksFromBlocks(state.dialogueBlocks, characters, { ...state, characterPresenceClips });
       return {
         ...state,
-        characters: state.characters.filter(c => c.id !== action.payload),
-        characterPresenceClips: (state.characterPresenceClips || []).filter(c => c.characterId !== action.payload),
+        characters,
+        characterPresenceClips,
+        tracks,
+        selectedClipId: state.selectedClipId === `presence_${action.payload}` ? null : state.selectedClipId,
       };
+    }
     
     case ActionTypes.ASSIGN_CHARACTER_ASSET: {
       const { characterId, asset } = action.payload;
@@ -463,8 +638,142 @@ function coreProjectReducer(state, action) {
     case ActionTypes.ADD_MEDIA:
       return { ...state, mediaItems: [...state.mediaItems, action.payload] };
     
-    case ActionTypes.REMOVE_MEDIA:
-      return { ...state, mediaItems: state.mediaItems.filter(m => m.id !== action.payload) };
+    case ActionTypes.IMPORT_IMAGE_FOLDER: {
+      const items = action.payload; // [{ id, name, path, ext, dataUrl }]
+      if (!items || items.length === 0) return state;
+      // Folder imports only add to the media library. Timeline placement is
+      // explicit: "Apply All Images to Timeline" or the long-form builder.
+      return {
+        ...state,
+        mediaItems: [...state.mediaItems, ...items],
+      };
+    }
+
+    case ActionTypes.APPLY_IMAGES_TO_TIMELINE: {
+      const items = action.payload; // already-imported media items
+      if (!items || items.length === 0) return state;
+
+      const { tracks, totalDuration } = placeImageClips(state, items);
+
+      return {
+        ...state,
+        tracks,
+        totalDuration,
+      };
+    }
+
+    case ActionTypes.SET_PROJECT_MODE: {
+      const { mode, width, height, fps } = action.payload || {};
+      const safeMode = mode === 'shortform' || mode === 'longform' ? mode : 'shortform';
+      return {
+        ...state,
+        projectMode: safeMode,
+        presetMeta: {
+          width: width || state.canvasWidth,
+          height: height || state.canvasHeight,
+          fps: fps || state.exportSettings.fps || 60,
+        },
+        canvasWidth: width || state.canvasWidth,
+        canvasHeight: height || state.canvasHeight,
+        exportSettings: {
+          ...state.exportSettings,
+          width: width || state.canvasWidth,
+          height: height || state.canvasHeight,
+          fps: fps || state.exportSettings.fps || 60,
+        },
+      };
+    }
+
+    case ActionTypes.BUILD_LONG_FORM_TIMELINE: {
+      const { scriptText } = action.payload || {};
+      const images = (state.mediaItems || []).filter(m => m.type === 'image');
+      const { blocks, characters, clips } = buildLongFormTimeline(scriptText, images);
+      if (!blocks.length || !clips.length) return state;
+
+      const characterPresenceClips = blocks.map(b => ({
+        id: `presence_${b.id}`,
+        characterId: b.characterId,
+        startTime: b.startTime,
+        duration: b.duration,
+      }));
+
+      // No trailing padding: the project ends exactly when the last image does.
+      const lastBlock = blocks[blocks.length - 1];
+      const totalDuration = Math.max(1, lastBlock.startTime + lastBlock.duration);
+      // Drop previously placed, unlinked image clips so a rebuild replaces
+      // them with the block-synced ones instead of duplicating them.
+      const strippedTracks = (state.tracks || []).map(track => ({
+        ...track,
+        clips: (track.clips || []).filter(c => !(c.type === 'image' && !c.blockId)),
+      }));
+      const tracks = generateTracksFromBlocks(blocks, characters, { ...state, totalDuration, characterPresenceClips, tracks: strippedTracks })
+        // Long-form has no character avatars on the timeline yet.
+        .filter(t => t.type !== 'character');
+
+      const slideshowTracks = tracks.map(track => {
+        if (track.type === 'video' && !(track.clips || []).some(c => c.id === 'clip_bg' && c.isDefaultDuration)) {
+          const existingIds = new Set((track.clips || []).map(c => c.blockId).filter(Boolean));
+          const newClips = clips.filter(c => !existingIds.has(c.blockId));
+          return newClips.length
+            ? { ...track, clips: [...track.clips, ...newClips].sort((a, b) => a.startTime - b.startTime) }
+            : track;
+        }
+        return track;
+      });
+      const hasImageTrack = slideshowTracks.some(t =>
+        t.type === 'video' && (t.clips || []).some(c => c.type === 'image')
+      );
+      const finalTracks = hasImageTrack
+        ? slideshowTracks
+        : [
+            ...slideshowTracks,
+            {
+              id: `track_slideshow_${Date.now()}`,
+              name: 'Slideshow',
+              type: 'video',
+              color: '#444466',
+              clips,
+            },
+          ];
+
+      return {
+        ...state,
+        projectMode: state.projectMode || 'longform',
+        scriptText,
+        dialogueBlocks: blocks,
+        characters,
+        characterPresenceClips,
+        tracks: finalTracks,
+        totalDuration,
+        selectedClipId: null,
+        selectedElementId: null,
+        selectedKeyframeIndex: null,
+      };
+    }
+
+    case ActionTypes.RESET_PROJECT: {
+      return {
+        ...initialState,
+        projectMode: null,
+        presetMeta: {},
+      };
+    }
+    
+    case ActionTypes.REMOVE_MEDIA: {
+      const mediaId = action.payload;
+      // Also drop timeline clips that referenced the deleted media item
+      const tracks = state.tracks.map(track => ({
+        ...track,
+        clips: (track.clips || []).filter(c => c.mediaId !== mediaId && c.id !== mediaId),
+      }));
+      return {
+        ...state,
+        mediaItems: state.mediaItems.filter(m => m.id !== mediaId),
+        tracks,
+        totalDuration: computeProjectDuration({ ...state, tracks }),
+        selectedClipId: state.selectedClipId === mediaId ? null : state.selectedClipId,
+      };
+    }
     
     case ActionTypes.RENAME_MEDIA: {
       const { id, name } = action.payload;
@@ -476,18 +785,28 @@ function coreProjectReducer(state, action) {
       const audio = action.payload;
       const tracks = state.tracks.map(track => {
         if (track.id === 'track_audio_1') {
+          if (!audio) return { ...track, clips: [] };
+          const existing = track.clips || [];
+          // Keep AI voiceover clips on the audio track; only the dialogue
+          // audio clip itself gets replaced (preserving its user props).
+          const existingClip = existing.find(c => c.id === 'clip_audio');
+          const audioClip = {
+            ...(existingClip || {}),
+            id: 'clip_audio',
+            name: audio.name || 'Dialogue Audio',
+            startTime: 0,
+            duration: audio.duration || state.totalDuration,
+            color: '#00e5ff',
+            path: audio.path,
+            dataUrl: audio.dataUrl,
+            type: 'audio',
+          };
+          const hasAudioClip = existing.some(c => c.id === 'clip_audio');
           return {
             ...track,
-            clips: audio ? [{
-              id: 'clip_audio',
-              name: audio.name || 'Dialogue Audio',
-              startTime: 0,
-              duration: audio.duration || state.totalDuration,
-              color: '#00e5ff',
-              path: audio.path,
-              dataUrl: audio.dataUrl,
-              type: 'audio',
-            }] : [],
+            clips: hasAudioClip
+              ? existing.map(c => (c.id === 'clip_audio' ? audioClip : c))
+              : [audioClip, ...existing],
           };
         }
         return track;
@@ -523,7 +842,7 @@ function coreProjectReducer(state, action) {
     }
 
     case ActionTypes.ADD_TRACK: {
-      const { type, name } = action.payload;
+      const { type, name, insertBeforeId } = action.payload;
       const trackId = `${type}_track_${Date.now()}`;
       let color = '#444466';
       if (type === 'audio') color = '#00e5ff';
@@ -536,7 +855,13 @@ function coreProjectReducer(state, action) {
         color,
         clips: [],
       };
-      
+
+      // Honor "insert above track X" (addTrack's 3rd arg)
+      const orderById = new Map(state.tracks.map((t, i) => [t.id, i]));
+      orderById.set(trackId, insertBeforeId !== undefined && orderById.has(insertBeforeId)
+        ? orderById.get(insertBeforeId) - 0.5
+        : state.tracks.length);
+
       const rawTracks = [...state.tracks, newTrack];
       rawTracks.sort((a, b) => {
         const isOverlayA = a.type === 'broll' || a.type === 'window';
@@ -544,8 +869,8 @@ function coreProjectReducer(state, action) {
         if (isOverlayA && !isOverlayB) return -1;
         if (!isOverlayA && isOverlayB) return 1;
         
-        const idxA = state.tracks.findIndex(t => t.id === a.id);
-        const idxB = state.tracks.findIndex(t => t.id === b.id);
+        const idxA = orderById.get(a.id) ?? state.tracks.length;
+        const idxB = orderById.get(b.id) ?? state.tracks.length;
         if (idxA === -1 && idxB === -1) return 0;
         if (idxA === -1) return 1;
         if (idxB === -1) return -1;
@@ -566,7 +891,15 @@ function coreProjectReducer(state, action) {
     
     case ActionTypes.REMOVE_TRACK: {
       const trackId = action.payload;
-      return { ...state, tracks: state.tracks.filter(t => t.id !== trackId) };
+      const track = state.tracks.find(t => t.id === trackId);
+      const selectedOnTrack = track && (track.clips || []).some(c => c.id === state.selectedClipId);
+      return {
+        ...state,
+        tracks: state.tracks.filter(t => t.id !== trackId),
+        selectedClipId: selectedOnTrack ? null : state.selectedClipId,
+        selectedElementId: selectedOnTrack && state.selectedElementId === trackId ? null : state.selectedElementId,
+        totalDuration: computeProjectDuration({ ...state, tracks: state.tracks.filter(t => t.id !== trackId) }),
+      };
     }
     
     case ActionTypes.UPDATE_TRACK_PROPERTIES: {
@@ -632,37 +965,49 @@ function coreProjectReducer(state, action) {
             finalStartTime = lastEnd;
           }
 
-          const adjustedClip = { ...clip, startTime: finalStartTime };
-          return {
-            ...track,
-            clips: [...track.clips, adjustedClip].sort((a, b) => a.startTime - b.startTime),
-          };
+      const adjustedClip = { ...clip, startTime: finalStartTime };
+      return {
+        ...track,
+        clips: [...track.clips, adjustedClip].sort((a, b) => a.startTime - b.startTime),
+      };
         });
       }
-      return { ...state, tracks };
+      return { ...state, tracks, totalDuration: computeProjectDuration({ ...state, tracks }) };
     }
     
     case ActionTypes.REMOVE_CLIP_FROM_TRACK: {
       const { trackId, clipId } = action.payload;
-      const isCharTrack = trackId.startsWith('track_') && trackId !== 'track_captions' && !trackId.startsWith('track_bg') && !trackId.startsWith('track_audio');
+      const track = state.tracks.find(t => t.id === trackId);
+      const isCharTrack = track && track.type === 'character';
       let characterPresenceClips = state.characterPresenceClips || [];
       if (isCharTrack) {
         characterPresenceClips = characterPresenceClips.filter(c => c.id !== clipId);
       }
-      const tracks = state.tracks.map(track => {
-        if (track.id !== trackId) return track;
+      const tracks = state.tracks.map(t => {
+        if (t.id !== trackId) return t;
         return {
-          ...track,
-          clips: track.clips.filter(c => c.id !== clipId),
+          ...t,
+          clips: t.clips.filter(c => c.id !== clipId),
         };
       });
-      return { ...state, tracks, characterPresenceClips };
+      return {
+        ...state,
+        tracks,
+        characterPresenceClips,
+        totalDuration: computeProjectDuration({ ...state, tracks }),
+        selectedClipId: state.selectedClipId === clipId ? null : state.selectedClipId,
+      };
     }
     
     case ActionTypes.UPDATE_CLIP_TIMING: {
       const { trackId, clipId, startTime, duration } = action.payload;
       
-      const track = state.tracks.find(t => t.id === trackId);
+      // The clip may have moved to another track since the drag began
+      // (Timeline captures trackId at drag start); resolve it by id first.
+      let track = state.tracks.find(t => t.id === trackId && t.clips.some(c => c.id === clipId));
+      if (!track) {
+        track = state.tracks.find(t => t.clips.some(c => c.id === clipId));
+      }
       if (!track) return state;
       const targetClip = track.clips.find(c => c.id === clipId);
       if (!targetClip) return state;
@@ -702,6 +1047,13 @@ function coreProjectReducer(state, action) {
             }
           }
           finalStartTime = bestStart;
+        } else {
+          // No gap fits: snap to the end of the last clip so the drag
+          // never leaves the clip overlapping or beyond the timeline.
+          const lastEnd = sortedOther.length > 0
+            ? Math.max(...sortedOther.map(c => c.startTime + c.duration))
+            : 0;
+          finalStartTime = Math.max(0, Math.min(lastEnd, startTime));
         }
       } else if (startTime !== undefined && duration !== undefined) {
         // Resizing left side
@@ -723,7 +1075,10 @@ function coreProjectReducer(state, action) {
         finalDuration = Math.max(0.2, Math.min(nextClipLimit - origStartTime, duration));
       }
 
-      const isCharTrack = trackId.startsWith('track_') && trackId !== 'track_captions' && !trackId.startsWith('track_bg') && !trackId.startsWith('track_audio');
+      // Never allow zero/negative durations regardless of path
+      finalDuration = Math.max(0.2, finalDuration);
+
+      const isCharTrack = track.type === 'character';
       let characterPresenceClips = state.characterPresenceClips || [];
       if (isCharTrack) {
         characterPresenceClips = characterPresenceClips.map(clip => {
@@ -736,7 +1091,7 @@ function coreProjectReducer(state, action) {
         });
       }
       const tracks = state.tracks.map(t => {
-        if (t.id !== trackId) return t;
+        if (t.id !== track.id) return t;
         return {
           ...t,
           clips: t.clips.map(clip => {
@@ -750,7 +1105,7 @@ function coreProjectReducer(state, action) {
           }),
         };
       });
-      return { ...state, tracks, characterPresenceClips };
+      return { ...state, tracks, characterPresenceClips, totalDuration: computeProjectDuration({ ...state, tracks }) };
     }
     
     case ActionTypes.UPDATE_CLIP_PROPERTIES: {
@@ -780,9 +1135,6 @@ function coreProjectReducer(state, action) {
     case ActionTypes.SET_PIXELS_PER_SECOND:
       return { ...state, pixelsPerSecond: action.payload };
     
-    case ActionTypes.SET_TOTAL_DURATION:
-      return { ...state, totalDuration: action.payload };
-    
     case ActionTypes.SELECT_CLIP: {
       const clipId = action.payload;
       if (!clipId) {
@@ -799,7 +1151,9 @@ function coreProjectReducer(state, action) {
         } else if (track.type === 'captions') {
           const clip = track.clips.find(c => c.id === clipId);
           if (clip && clip.blockId) {
-            selectedElementId = `caption_${clip.blockId}`;
+            const block = state.dialogueBlocks.find(b => b.id === clip.blockId);
+            // drawFrame keys captions by character id, not block id
+            selectedElementId = `caption_${block ? block.characterId : clip.blockId}`;
           }
         }
       }
@@ -839,10 +1193,28 @@ function coreProjectReducer(state, action) {
 
     case ActionTypes.SET_PROJECT_RESOLUTION: {
       const { width, height } = action.payload;
+      const scaleX = width / (state.canvasWidth || width);
+      const scaleY = height / (state.canvasHeight || height);
+      if (scaleX === 1 && scaleY === 1) {
+        return { ...state, canvasWidth: width, canvasHeight: height };
+      }
+      // Rescale canvas-space transforms so elements stay put in a new resolution
+      const characterTransforms = {};
+      for (const [key, t] of Object.entries(state.characterTransforms || {})) {
+        characterTransforms[key] = { ...t, x: t.x * scaleX, y: t.y * scaleY };
+      }
+      const characters = (state.characters || []).map(char => {
+        const fs = char.textStyle && typeof char.textStyle.fontSize === 'number'
+          ? char.textStyle.fontSize * Math.min(scaleX, scaleY)
+          : undefined;
+        return fs === undefined ? char : { ...char, textStyle: { ...char.textStyle, fontSize: fs } };
+      });
       return {
         ...state,
         canvasWidth: width,
         canvasHeight: height,
+        characterTransforms,
+        characters,
         exportSettings: {
           ...state.exportSettings,
           width,
@@ -932,7 +1304,7 @@ function coreProjectReducer(state, action) {
         
         const block2 = {
           ...block,
-          id: `block_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: `block_${Date.now()}_${uid()}`,
           startTime: splitTime,
           duration: duration2,
           text: text2 || '...',
@@ -964,7 +1336,7 @@ function coreProjectReducer(state, action) {
       
       const clip2 = {
         ...clip,
-        id: `clip_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `clip_${Date.now()}_${uid()}`,
         startTime: splitTime,
         duration: duration2,
         blockId: null, // Clear blockId so it behaves as an independent clip
@@ -983,6 +1355,7 @@ function coreProjectReducer(state, action) {
       return {
         ...state,
         tracks,
+        totalDuration: computeProjectDuration({ ...state, tracks }),
       };
     }
     
@@ -1073,7 +1446,7 @@ function coreProjectReducer(state, action) {
             };
           } else if (tIdx === audioTrackIdx) {
             clips.push({
-              id: `clip_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              id: `clip_${Date.now()}_${uid()}`,
               name: item.name,
               startTime: correspondingBlock.startTime,
               duration: item.duration,
@@ -1286,7 +1659,7 @@ function coreProjectReducer(state, action) {
         return t;
       });
       
-      return { ...state, tracks };
+      return { ...state, tracks, totalDuration: computeProjectDuration({ ...state, tracks }) };
     }
     
     case ActionTypes.EXTRACT_AUDIO: {
@@ -1412,9 +1785,16 @@ function coreProjectReducer(state, action) {
 
     case ActionTypes.DELETE_ALL_VOICES_FROM_LIBRARY: {
       const mediaItems = state.mediaItems.filter(item => !item.isVoiceClone);
+      // Drop timeline clips that referenced deleted voice clones
+      const tracks = state.tracks.map(track => ({
+        ...track,
+        clips: (track.clips || []).filter(c => !(c.mediaId && c.mediaId !== c.id && state.mediaItems.find(m => m.id === c.mediaId && m.isVoiceClone))),
+      }));
       return {
         ...state,
         mediaItems,
+        tracks,
+        totalDuration: computeProjectDuration({ ...state, tracks }),
       };
     }
 
@@ -1423,7 +1803,7 @@ function coreProjectReducer(state, action) {
   }
 }
 
-// ─── History & Undo/Redo Wrapper Reducer ───
+// â”€â”€â”€ History & Undo/Redo Wrapper Reducer â”€â”€â”€
 const UNDOABLE_ACTIONS = new Set([
   'SET_SCRIPT',
   'PARSE_SCRIPT',
@@ -1437,6 +1817,11 @@ const UNDOABLE_ACTIONS = new Set([
   'ADD_MEDIA',
   'REMOVE_MEDIA',
   'RENAME_MEDIA',
+  'IMPORT_IMAGE_FOLDER',
+  'APPLY_IMAGES_TO_TIMELINE',
+  'BUILD_LONG_FORM_TIMELINE',
+  'SET_PROJECT_MODE',
+  'RESET_PROJECT',
   'SET_BACKGROUND_VIDEO',
   'SET_AUDIO',
   'UPDATE_CHARACTER_STYLE',
@@ -1458,6 +1843,10 @@ const UNDOABLE_ACTIONS = new Set([
   'SET_BROLL_LAYOUT',
   'SET_BROLL_SETTINGS',
   'SET_WINDOW_SLIDESHOW_ENABLED',
+  'SET_PROJECT_RESOLUTION',
+  'SPLIT_CLIP',
+  'REMOVE_ALL_VOICES_FROM_TIMELINE',
+  'DELETE_ALL_VOICES_FROM_LIBRARY',
 ]);
 
 function getHumanReadableActionName(actionType) {
@@ -1473,6 +1862,11 @@ function getHumanReadableActionName(actionType) {
     ADD_MEDIA: 'Import Media',
     REMOVE_MEDIA: 'Remove Media',
     RENAME_MEDIA: 'Rename Media',
+    IMPORT_IMAGE_FOLDER: 'Import Image Folder',
+    APPLY_IMAGES_TO_TIMELINE: 'Apply Images to Timeline',
+    BUILD_LONG_FORM_TIMELINE: 'Build Long-Form Timeline',
+    SET_PROJECT_MODE: 'Choose Project Preset',
+    RESET_PROJECT: 'New Project',
     SET_AUDIO: 'Set Audio File',
     SET_BACKGROUND_VIDEO: 'Set Background Video',
     ADD_TRACK: 'Add Track',
@@ -1512,6 +1906,7 @@ function getProjectSnapshot(state) {
     scriptText: state.scriptText,
     dialogueBlocks: state.dialogueBlocks,
     characters: state.characters,
+    characterPresenceClips: state.characterPresenceClips,
     tracks: state.tracks,
     totalDuration: state.totalDuration,
     characterTransforms: state.characterTransforms,
@@ -1526,7 +1921,21 @@ function getProjectSnapshot(state) {
     brollHeight: state.brollHeight,
     brollAspectRatio: state.brollAspectRatio,
     windowSlideshowEnabled: state.windowSlideshowEnabled,
+    canvasWidth: state.canvasWidth,
+    canvasHeight: state.canvasHeight,
   };
+}
+
+// Cheap "did anything change" test. Reducers only ever replace top-level
+// references on real changes, so reference comparison is exact and avoids
+// serializing large media items (base64 dataUrls) on every action.
+function snapshotsDiffer(a, b) {
+  const keys = Object.keys(a);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (a[key] !== b[key]) return true;
+  }
+  return false;
 }
 
 function projectReducer(state, action) {
@@ -1544,7 +1953,7 @@ function projectReducer(state, action) {
       history: {
         past: newPast,
         future: [{ ...currentSnapshot, lastActionLabel: state.lastActionLabel || 'Open Project' }, ...future],
-        dragStartSnapshot,
+        dragStartSnapshot: null,
       }
     };
   }
@@ -1557,13 +1966,16 @@ function projectReducer(state, action) {
     const newFuture = future.slice(1);
     const currentSnapshot = getProjectSnapshot(state);
     
+    const newPast = [...past, { ...currentSnapshot, lastActionLabel: state.lastActionLabel || 'Open Project' }];
+    if (newPast.length > 50) newPast.shift();
+    
     return {
       ...state,
       ...next,
       history: {
-        past: [...past, { ...currentSnapshot, lastActionLabel: state.lastActionLabel || 'Open Project' }],
+        past: newPast,
         future: newFuture,
-        dragStartSnapshot,
+        dragStartSnapshot: null,
       }
     };
   }
@@ -1629,7 +2041,7 @@ function projectReducer(state, action) {
     if (!dragStartSnapshot) return state;
     
     const currentSnapshot = getProjectSnapshot(state);
-    const hasChanged = JSON.stringify(currentSnapshot) !== JSON.stringify(dragStartSnapshot);
+    const hasChanged = snapshotsDiffer(currentSnapshot, dragStartSnapshot);
     
     if (hasChanged) {
       const actionLabel = "Drag Element";
@@ -1656,33 +2068,45 @@ function projectReducer(state, action) {
     }
   }
 
-  const shouldSaveHistory = UNDOABLE_ACTIONS.has(action.type);
+  // While a drag is in progress, intermediate moves are not recorded; the
+  // pre-drag snapshot is committed once by END_DRAG_HISTORY instead.
+  const isDragging = !!(state.history && state.history.dragStartSnapshot);
+  const isDragTimingAction =
+    action.type === ActionTypes.UPDATE_CLIP_TIMING ||
+    action.type === ActionTypes.UPDATE_BLOCK_TIMING;
+  const shouldSaveHistory = UNDOABLE_ACTIONS.has(action.type) && !(isDragging && isDragTimingAction);
   const preSnapshot = shouldSaveHistory ? getProjectSnapshot(state) : null;
 
   const nextState = coreProjectReducer(state, action);
 
-  if (nextState && !nextState.characterPresenceClips && nextState.dialogueBlocks) {
-    nextState.characterPresenceClips = nextState.dialogueBlocks.map(b => ({
-      id: `presence_${b.id}`,
-      characterId: b.characterId,
-      startTime: b.startTime,
-      duration: b.duration,
-    }));
-  }
+  // Pure fallback: if a reducer produced dialogueBlocks without presence
+  // clips, derive them instead of mutating nextState in place.
+  const derivedState =
+    nextState && !nextState.characterPresenceClips && nextState.dialogueBlocks
+      ? {
+          ...nextState,
+          characterPresenceClips: nextState.dialogueBlocks.map(b => ({
+            id: `presence_${b.id}`,
+            characterId: b.characterId,
+            startTime: b.startTime,
+            duration: b.duration,
+          })),
+        }
+      : nextState;
 
   if (shouldSaveHistory) {
     const postSnapshot = getProjectSnapshot(nextState);
-    const hasChanged = JSON.stringify(preSnapshot) !== JSON.stringify(postSnapshot);
+    const hasChanged = snapshotsDiffer(preSnapshot, postSnapshot);
     
     if (hasChanged) {
       const actionLabel = getHumanReadableActionName(action.type);
-      nextState.lastActionLabel = actionLabel;
       
       const newPast = [...state.history.past, { ...preSnapshot, lastActionLabel: state.lastActionLabel || 'Open Project' }];
       if (newPast.length > 50) newPast.shift();
       
       return {
-        ...nextState,
+        ...derivedState,
+        lastActionLabel: actionLabel,
         history: {
           past: newPast,
           future: [],
@@ -1692,7 +2116,7 @@ function projectReducer(state, action) {
     }
   }
 
-  return nextState;
+  return derivedState;
 }
 
 /**
@@ -1853,272 +2277,294 @@ function generateTracksFromBlocks(blocks, characters, state) {
   return combined;
 }
 
-// ─── Context Provider ───
+// â”€â”€â”€ Context Provider â”€â”€â”€
 export function ProjectProvider({ children }) {
   const [state, dispatch] = useReducer(projectReducer, initialState);
 
-  // ── Action creators ──
-  const actions = {
-    setScript: useCallback((text) => {
+  // â”€â”€ Action creators â”€â”€
+  // Built once: every action only dispatches, so the object identity is
+  // stable across renders (stops effect churn in consumers).
+  const actionsRef = useRef(null);
+  if (!actionsRef.current) {
+    actionsRef.current = {
+    setScript: ((text) => {
       dispatch({ type: ActionTypes.SET_SCRIPT, payload: text });
-    }, []),
+    }),
     
-    parseScript: useCallback((text) => {
+    parseScript: ((text) => {
       dispatch({ type: ActionTypes.PARSE_SCRIPT, payload: text });
-    }, []),
+    }),
     
-    updateBlock: useCallback((id, changes) => {
+    updateBlock: ((id, changes) => {
       dispatch({ type: ActionTypes.UPDATE_BLOCK, payload: { id, changes } });
-    }, []),
+    }),
     
-    updateBlockTiming: useCallback((blockId, startTime, duration) => {
+    updateBlockTiming: ((blockId, startTime, duration) => {
       dispatch({ type: ActionTypes.UPDATE_BLOCK_TIMING, payload: { blockId, startTime, duration } });
-    }, []),
+    }),
     
-    setBlocks: useCallback((blocks) => {
+    setBlocks: ((blocks) => {
       dispatch({ type: ActionTypes.SET_BLOCKS, payload: blocks });
-    }, []),
+    }),
     
-    addCharacter: useCallback((name) => {
+    addCharacter: ((name) => {
       dispatch({ type: ActionTypes.ADD_CHARACTER, payload: name });
-    }, []),
+    }),
     
-    updateCharacter: useCallback((id, changes) => {
+    updateCharacter: ((id, changes) => {
       dispatch({ type: ActionTypes.UPDATE_CHARACTER, payload: { id, changes } });
-    }, []),
+    }),
     
-    removeCharacter: useCallback((id) => {
+    removeCharacter: ((id) => {
       dispatch({ type: ActionTypes.REMOVE_CHARACTER, payload: id });
-    }, []),
+    }),
     
-    assignCharacterAsset: useCallback((characterId, asset) => {
+    assignCharacterAsset: ((characterId, asset) => {
       dispatch({ type: ActionTypes.ASSIGN_CHARACTER_ASSET, payload: { characterId, asset } });
-    }, []),
+    }),
     
-    addMedia: useCallback((item) => {
+    addMedia: ((item) => {
       dispatch({ type: ActionTypes.ADD_MEDIA, payload: item });
-    }, []),
+    }),
     
-    removeMedia: useCallback((id) => {
+    removeMedia: ((id) => {
       dispatch({ type: ActionTypes.REMOVE_MEDIA, payload: id });
-    }, []),
+    }),
     
-    renameMedia: useCallback((id, name) => {
+    renameMedia: ((id, name) => {
       dispatch({ type: ActionTypes.RENAME_MEDIA, payload: { id, name } });
-    }, []),
+    }),
     
-    setAudio: useCallback((audio) => {
+    importImageFolder: ((items) => {
+      dispatch({ type: ActionTypes.IMPORT_IMAGE_FOLDER, payload: items });
+    }),
+    
+    setAudio: ((audio) => {
       dispatch({ type: ActionTypes.SET_AUDIO, payload: audio });
-    }, []),
+    }),
     
-    setAudioBuffer: useCallback((buffer) => {
+    setAudioBuffer: ((buffer) => {
       dispatch({ type: ActionTypes.SET_AUDIO_BUFFER, payload: buffer });
-    }, []),
+    }),
     
-    setBackgroundVideo: useCallback((video) => {
+    setBackgroundVideo: ((video) => {
       dispatch({ type: ActionTypes.SET_BACKGROUND_VIDEO, payload: video });
-    }, []),
+    }),
     
-    setCurrentTime: useCallback((time) => {
+    setCurrentTime: ((time) => {
       dispatch({ type: ActionTypes.SET_CURRENT_TIME, payload: time });
-    }, []),
+    }),
     
-    setPlaying: useCallback((playing) => {
+    setPlaying: ((playing) => {
       dispatch({ type: ActionTypes.SET_PLAYING, payload: playing });
-    }, []),
+    }),
     
-    setPixelsPerSecond: useCallback((pps) => {
+    setPixelsPerSecond: ((pps) => {
       dispatch({ type: ActionTypes.SET_PIXELS_PER_SECOND, payload: pps });
-    }, []),
+    }),
     
-    setTotalDuration: useCallback((duration) => {
-      dispatch({ type: ActionTypes.SET_TOTAL_DURATION, payload: duration });
-    }, []),
-    
-    selectClip: useCallback((id) => {
+    selectClip: ((id) => {
       dispatch({ type: ActionTypes.SELECT_CLIP, payload: id });
-    }, []),
+    }),
     
-    setCharacterTransform: useCallback((characterId, transform) => {
+    setCharacterTransform: ((characterId, transform) => {
       dispatch({ type: ActionTypes.SET_CHARACTER_TRANSFORM, payload: { characterId, transform } });
-    }, []),
+    }),
     
-    selectElement: useCallback((id) => {
+    selectElement: ((id) => {
       dispatch({ type: ActionTypes.SELECT_ELEMENT, payload: id });
-    }, []),
+    }),
 
-    selectKeyframe: useCallback((index) => {
+    selectKeyframe: ((index) => {
       dispatch({ type: ActionTypes.SELECT_KEYFRAME, payload: index });
-    }, []),
+    }),
     
-    setActiveTool: useCallback((tool) => {
+    setActiveTool: ((tool) => {
       dispatch({ type: ActionTypes.SET_ACTIVE_TOOL, payload: tool });
-    }, []),
+    }),
     
-    setShowExportModal: useCallback((show) => {
+    setShowExportModal: ((show) => {
       dispatch({ type: ActionTypes.SET_SHOW_EXPORT_MODAL, payload: show });
-    }, []),
+    }),
 
-    setProjectResolution: useCallback((width, height) => {
+    setProjectResolution: ((width, height) => {
       dispatch({ type: ActionTypes.SET_PROJECT_RESOLUTION, payload: { width, height } });
-    }, []),
+    }),
 
-    splitClip: useCallback((trackId, clipId, splitTime) => {
+    setProjectMode: ((mode, { width, height, fps } = {}) => {
+      dispatch({ type: ActionTypes.SET_PROJECT_MODE, payload: { mode, width, height, fps } });
+    }),
+
+    applyImagesToTimeline: ((items) => {
+      dispatch({ type: ActionTypes.APPLY_IMAGES_TO_TIMELINE, payload: items });
+    }),
+
+    buildLongFormTimeline: ((scriptText) => {
+      dispatch({ type: ActionTypes.BUILD_LONG_FORM_TIMELINE, payload: { scriptText } });
+    }),
+
+    resetProject: (() => {
+      dispatch({ type: ActionTypes.RESET_PROJECT });
+    }),
+
+    splitClip: ((trackId, clipId, splitTime) => {
       dispatch({ type: ActionTypes.SPLIT_CLIP, payload: { trackId, clipId, splitTime } });
-    }, []),
+    }),
     
-    setExportSettings: useCallback((settings) => {
+    setExportSettings: ((settings) => {
       dispatch({ type: ActionTypes.SET_EXPORT_SETTINGS, payload: settings });
-    }, []),
+    }),
     
-    setExporting: useCallback((exporting) => {
+    setExporting: ((exporting) => {
       dispatch({ type: ActionTypes.SET_EXPORTING, payload: exporting });
-    }, []),
+    }),
     
-    setExportProgress: useCallback((progress) => {
+    setExportProgress: ((progress) => {
       dispatch({ type: ActionTypes.SET_EXPORT_PROGRESS, payload: progress });
-    }, []),
+    }),
     
-    addToast: useCallback((message, type = 'info') => {
-      const id = `toast_${Date.now()}`;
+    addToast: ((message, type = 'info') => {
+      const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       dispatch({ type: ActionTypes.ADD_TOAST, payload: { id, message, type } });
       setTimeout(() => {
         dispatch({ type: ActionTypes.REMOVE_TOAST, payload: id });
       }, 4000);
-    }, []),
+    }),
 
-    updateCharacterStyle: useCallback((characterId, style) => {
+    updateCharacterStyle: ((characterId, style) => {
       dispatch({ type: ActionTypes.UPDATE_CHARACTER_STYLE, payload: { characterId, style } });
-    }, []),
+    }),
 
-    updateBlockAnimation: useCallback((blockId, animation) => {
+    updateBlockAnimation: ((blockId, animation) => {
       dispatch({ type: ActionTypes.UPDATE_BLOCK_ANIMATION, payload: { blockId, animation } });
-    }, []),
+    }),
 
-    batchUpdateAnimation: useCallback((characterId, animation) => {
+    batchUpdateAnimation: ((characterId, animation) => {
       dispatch({ type: ActionTypes.BATCH_UPDATE_ANIMATION, payload: { characterId, animation } });
-    }, []),
+    }),
 
-    addTrack: useCallback((type, name) => {
+    addTrack: ((type, name) => {
       dispatch({ type: ActionTypes.ADD_TRACK, payload: { type, name } });
-    }, []),
+    }),
 
-    removeTrack: useCallback((trackId) => {
+    removeTrack: ((trackId) => {
       dispatch({ type: ActionTypes.REMOVE_TRACK, payload: trackId });
-    }, []),
+    }),
 
-    updateTrackProperties: useCallback((trackId, properties) => {
+    updateTrackProperties: ((trackId, properties) => {
       dispatch({ type: ActionTypes.UPDATE_TRACK_PROPERTIES, payload: { trackId, properties } });
-    }, []),
+    }),
 
-    addClipToTrack: useCallback((trackId, clip) => {
+    addClipToTrack: ((trackId, clip) => {
       dispatch({ type: ActionTypes.ADD_CLIP_TO_TRACK, payload: { trackId, clip } });
-    }, []),
+    }),
 
-    removeClipFromTrack: useCallback((trackId, clipId) => {
+    removeClipFromTrack: ((trackId, clipId) => {
       dispatch({ type: ActionTypes.REMOVE_CLIP_FROM_TRACK, payload: { trackId, clipId } });
-    }, []),
+    }),
 
-    updateClipTiming: useCallback((trackId, clipId, startTime, duration) => {
+    updateClipTiming: ((trackId, clipId, startTime, duration) => {
       dispatch({ type: ActionTypes.UPDATE_CLIP_TIMING, payload: { trackId, clipId, startTime, duration } });
-    }, []),
+    }),
 
-    updateClipProperties: useCallback((trackId, clipId, properties) => {
+    updateClipProperties: ((trackId, clipId, properties) => {
       dispatch({ type: ActionTypes.UPDATE_CLIP_PROPERTIES, payload: { trackId, clipId, properties } });
-    }, []),
+    }),
 
-    setVoiceConfigs: useCallback((configs) => {
+    setVoiceConfigs: ((configs) => {
       dispatch({ type: ActionTypes.SET_VOICE_CONFIGS, payload: configs });
-    }, []),
+    }),
 
-    undo: useCallback(() => {
+    undo: (() => {
       dispatch({ type: ActionTypes.UNDO });
-    }, []),
+    }),
 
-    redo: useCallback(() => {
+    redo: (() => {
       dispatch({ type: ActionTypes.REDO });
-    }, []),
+    }),
 
-    jumpToHistoryState: useCallback((index) => {
+    jumpToHistoryState: ((index) => {
       dispatch({ type: ActionTypes.JUMP_TO_HISTORY_STATE, payload: index });
-    }, []),
+    }),
 
-    startDragHistory: useCallback(() => {
+    startDragHistory: (() => {
       dispatch({ type: ActionTypes.START_DRAG_HISTORY });
-    }, []),
+    }),
 
-    endDragHistory: useCallback(() => {
+    endDragHistory: (() => {
       dispatch({ type: ActionTypes.END_DRAG_HISTORY });
-    }, []),
+    }),
 
-    applyVoices: useCallback((items) => {
+    applyVoices: ((items) => {
       dispatch({ type: ActionTypes.BATCH_APPLY_VOICES, payload: items });
-    }, []),
+    }),
 
-    setTracks: useCallback((tracks) => {
+    setTracks: ((tracks) => {
       dispatch({ type: ActionTypes.SET_TRACKS, payload: tracks });
-    }, []),
+    }),
 
-    toggleCharacterKeyframing: useCallback((characterId, enabled) => {
+    toggleCharacterKeyframing: ((characterId, enabled) => {
       dispatch({ type: ActionTypes.TOGGLE_CHARACTER_KEYFRAMING, payload: { characterId, enabled } });
-    }, []),
+    }),
 
-    addCharacterKeyframe: useCallback((characterId, time, transform) => {
+    addCharacterKeyframe: ((characterId, time, transform) => {
       dispatch({ type: ActionTypes.ADD_KEYFRAME, payload: { characterId, time, transform } });
-    }, []),
+    }),
 
-    removeCharacterKeyframe: useCallback((characterId, index) => {
+    removeCharacterKeyframe: ((characterId, index) => {
       dispatch({ type: ActionTypes.REMOVE_KEYFRAME, payload: { characterId, index } });
-    }, []),
+    }),
 
-    updateCharacterKeyframe: useCallback((characterId, index, keyframeData) => {
+    updateCharacterKeyframe: ((characterId, index, keyframeData) => {
       dispatch({ type: ActionTypes.UPDATE_KEYFRAME, payload: { characterId, index, keyframeData } });
-    }, []),
+    }),
 
-    removeAllVoicesFromTimeline: useCallback(() => {
+    removeAllVoicesFromTimeline: (() => {
       dispatch({ type: ActionTypes.REMOVE_ALL_VOICES_FROM_TIMELINE });
-    }, []),
+    }),
 
-    deleteAllVoiceClipsFromLibrary: useCallback(() => {
+    deleteAllVoiceClipsFromLibrary: (() => {
       dispatch({ type: ActionTypes.DELETE_ALL_VOICES_FROM_LIBRARY });
-    }, []),
+    }),
 
-    resetCharacterTransform: useCallback((characterId) => {
+    resetCharacterTransform: ((characterId) => {
       dispatch({ type: ActionTypes.RESET_CHARACTER_TRANSFORM, payload: characterId });
-    }, []),
+    }),
 
-    resetCharacterKeyframes: useCallback((characterId) => {
+    resetCharacterKeyframes: ((characterId) => {
       dispatch({ type: ActionTypes.RESET_CHARACTER_KEYFRAMES, payload: characterId });
-    }, []),
+    }),
 
-    setClipLock: useCallback((blockId, locked) => {
+    setClipLock: ((blockId, locked) => {
       dispatch({ type: ActionTypes.SET_CLIP_LOCK, payload: { blockId, locked } });
-    }, []),
+    }),
 
-    resetTimeline: useCallback(() => {
+    resetTimeline: (() => {
       dispatch({ type: ActionTypes.RESET_TIMELINE });
-    }, []),
+    }),
 
-    moveClipToTrack: useCallback((clipId, fromTrackId, toTrackId) => {
+    moveClipToTrack: ((clipId, fromTrackId, toTrackId) => {
       dispatch({ type: ActionTypes.MOVE_CLIP_TO_TRACK, payload: { clipId, fromTrackId, toTrackId } });
-    }, []),
+    }),
 
-    extractAudio: useCallback((videoTrackId, clipId) => {
+    extractAudio: ((videoTrackId, clipId) => {
       dispatch({ type: ActionTypes.EXTRACT_AUDIO, payload: { videoTrackId, clipId } });
-    }, []),
+    }),
 
-    setBrollLayout: useCallback((layout) => {
+    setBrollLayout: ((layout) => {
       dispatch({ type: ActionTypes.SET_BROLL_LAYOUT, payload: { layout } });
-    }, []),
+    }),
 
-    setBrollSettings: useCallback((settings) => {
+    setBrollSettings: ((settings) => {
       dispatch({ type: ActionTypes.SET_BROLL_SETTINGS, payload: settings });
-    }, []),
+    }),
 
-    setWindowSlideshowEnabled: useCallback((enabled) => {
+    setWindowSlideshowEnabled: ((enabled) => {
       dispatch({ type: ActionTypes.SET_WINDOW_SLIDESHOW_ENABLED, payload: enabled });
-    }, []),
-  };
+    }),
+    };
+  }
+  const actions = actionsRef.current;
 
   return (
     <ProjectContext.Provider value={{ state, actions, dispatch }}>
@@ -2133,4 +2579,4 @@ export function useProject() {
   return context;
 }
 
-export { ActionTypes };
+export { ActionTypes, initialState, coreProjectReducer, projectReducer };

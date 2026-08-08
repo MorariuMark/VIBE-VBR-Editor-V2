@@ -1,140 +1,135 @@
-# 🎬 VIBE-BR-Video Editor
+# 🎬 VIBE-BR Video Editor
 
-> **Automated Multi-Character Dialogue Video Editor** tailored for creating short-form, high-engagement content.
+> **Automated multi-character dialogue video editor** for short-form brain-rot content and long-form video automation.
+
+Turn a script + a folder of images into a finished video. The app parses the script, matches images to the dialogue using a filename naming convention, arranges everything on a multi-track timeline, generates character voices with local TTS, and exports with FFmpeg — no manual editing required.
 
 ---
 
-## 🌟 Overview
+## ✨ Features
 
-**VIBE-BR-Video Editor** is a professional desktop application designed to streamline the production of multi-character dialogue videos. By combining a multi-track timeline, automated script parsing, and real-time canvas rendering, it automates syncing character visual states (like PNG animations) to multi-voice TTS audio, layered over background gameplay footage.
+### 📝 Script Parsing
+- Paste dialogue scripts formatted as `**Character:** line` or `Name: line`.
+- Characters and per-speaker timeline tracks are auto-generated.
+- `Name:` blocks support multi-line dialogue.
 
-Ideal for content creators aiming for YouTube Shorts, TikTok, and Instagram Reels, VIBE-BR eliminates the tedious manual editing of standard video tools.
+### 🖼️ Image → Timeline Sync (Naming Convention)
+Timeline placement is driven by **filenames**, so an image folder + script fully automate the edit:
+
+```
+<png in folder>  ->  "<start phrase> ___ <end phrase>.png"
+```
+
+- The image appears when the **start phrase** begins being spoken.
+- The image disappears when the **end phrase** finishes being spoken.
+- No `___` separator → the whole filename is the covered span.
+- Fuzzy matching tolerates typos, number words (`one` = `1`), and small word skips.
+- Timing comes from TTS word timings when available, otherwise proportional estimates.
+
+### 🤖 VBS Automation Engine
+A build-script language (`VBS`) drives the whole pipeline from a console panel:
+
+- `PARSE_SCRIPT`, `GENERATE_VOICES`, `APPLY_VOICES`, `SET_VOICE`, `APPLY_RANDOM_BACKGROUND`
+- Variables (`SET`), loops (`FOR ... ENDFOR`), conditionals (`IF/ELSE/ENDIF`)
+- Model management (`LOAD_MODEL`, `UNLOAD_MODEL`) and full export orchestration
+- Guardrails: loop iteration caps, per-command line numbers, clean abort handling
+
+### 🎙️ Voice Cloning & TTS
+- Local Python server (Flask + LuxTTS / Qwen3-TTS) — no cloud calls.
+- Reference-audio voice cloning, word-level timings, per-character voice configs.
+- Voice lines land on the timeline automatically with word-synced captions.
+
+### ⏱️ Multi-Track Timeline
+- Character, captions, video, broll/PIP, window (slideshow), and audio tracks.
+- Drag, resize, split, lock, rename, extract audio; overlap prevention.
+- Zoomable ruler, waveform rendering, undo/redo history (drag-safe).
+
+### 🎨 Real-Time Preview Canvas
+- Canvas 2D renderer with free-transform handles (drag / rotate / scale / flip / skew).
+- Keyframe animation, entrance/exit transitions, word-synced caption highlighting.
+- Character PNG assets with per-character text styles (color, stroke, glow, background).
+
+### 📤 FFmpeg Export
+- Canvas frame streaming (GPU-accelerated) or native FFmpeg mode.
+- GPU codec detection (NVENC / AMF / QSV) with automatic fallback.
+- Presets (9:16, 1:1, 16:9), custom resolution/FPS/CRF, audio mixing of all timeline clips.
+
+### 🪟 Multi-Window Desktop App
+- **Project Settings** window — resolution, FPS, broll layout, project metadata.
+- **Voice Cloning** window — generate/preview voices before applying.
+- **Vector Graphics Studio** — create SVG-style overlays and export them to media.
 
 ---
 
 ## 🚀 Quick Start
 
 ### Prerequisites
-- **Node.js**: v18 or later (recommended)
-- **FFmpeg**: A valid FFmpeg binary is required for export (place it in the local `./bin/` folder or ensure it is in your system's `PATH`).
+- **Node.js** 18+
+- **FFmpeg** — placed in `./bin/` or available on `PATH` (auto-detected from common install locations).
+- *(Optional, for voice cloning)* Python 3.10+ venv with the TTS deps in `./.venv/`.
 
-### Installation
-Clone the repository and install dependencies:
+### Setup
 ```bash
-git clone https://github.com/<username>/vibe-br-video-editor.git
-cd vibe-br-video-editor
+git clone https://github.com/MorariuMark/VIBE-BR-Video-Editor.git
+cd VIBE-BR-Video-Editor
 npm install
 ```
 
-### Running Locally
-To launch the application in development mode (spawning both the Vite dev server and the Electron container):
+### Run (dev)
 ```bash
 npm run dev
 ```
+Spins up the Vite dev server and launches Electron.
 
-### Packaging & Build
-To compile the React bundle and package the desktop app for distribution (using `electron-builder`):
+### Package
 ```bash
-npm run build
+npm run build          # vite build + electron-builder (NSIS installer + zip)
 ```
 
 ---
 
-## 🎨 Core Features
-
-### 📝 Smart Script Parser
-- **Pattern Matching**: Paste standard formatted scripts like `**CharacterName:** Dialogue content` to automatically detect characters.
-- **Auto-Track Generation**: Spawns dedicated tracks on the timeline for each speaker.
-- **Custom Keywords**: Define custom keyword sets to detect new characters on the fly.
-- **Silence Sync**: Analyzes audio tracks to line up speech pauses.
-
-### 🖼️ Real-Time Preview Canvas
-- **HTML5 Canvas 2D Engine**: High-performance rendering of dynamic media.
-- **Free Transform Controls**: Scale, rotate, drag, and layer character sprites directly in the viewer.
-- **Micro-Animations**: Built-in visual triggers such as *Pop*, *Slide*, *Fade*, and *Zoom-Spin* that synchronize with speaking actions.
-- **Smart Captions**: Automatically wrapped dialogue text overlays with customizable styles.
-
-### ⏱️ Multi-Track Timeline
-- **Visual Waveform**: A synchronized audio waveform track to track vocal beats.
-- **Independent Character Tracks**: Easily adjust individual duration, animations, and transitions.
-- **Precise Playhead Controls**: Zoomable ruler, timeline snapping, and frame-by-frame scrubbing.
-- **Drag & Resize**: Intuitive layout adjustments.
-
-### 📤 Multi-Format Exporter
-- **FFmpeg Render Pipeline**: Blazing-fast, high-quality rendering.
-- **Aspect Ratio Presets**:
-  - 📱 TikTok / Shorts (9:16)
-  - 📸 Instagram Square (1:1)
-  - 🖥️ Standard Landscape (16:9)
-- **Advanced Control**: Fine-tune output resolution, framerate (FPS), and bitrates.
-
----
-
-## 🏗️ Architecture & Tech Stack
-
-```mermaid
-graph TD
-    A[Vite Developer Server] -->|Hot Reload| B(React 18 Frontend)
-    B -->|IPC Calls| C(Electron 28 Container)
-    C -->|Processes Tasks| D[Local System Files / Logs]
-    C -->|Invokes Commands| E[FFmpeg Native Binary]
-    B -->|Renders States| F[HTML5 Canvas Render Engine]
-```
-
-### Technologies Used
-* **Frontend Framework**: [React 18](https://react.dev/) + [Vite](https://vitejs.dev/) for quick HMR.
-* **Desktop Platform**: [Electron 28](https://www.electronjs.org/) for native OS integration and local filesystem access.
-* **Graphics**: HTML5 Canvas 2D API for real-time asset layering.
-* **Processing**: [FFmpeg](https://ffmpeg.org/) for stitching background tracks, speaking characters, captions, and audio files.
-
----
-
-## 📁 Project Structure
+## 🏗️ Architecture
 
 ```
-├── electron/           # Electron main process & preload scripts
-│   ├── main.js         # Native window management, IPC handlers, app lifecycle
-│   └── preload.js      # Context bridge exposing electronAPI to the renderer
+React 18 + Vite  ──IPC──►  Electron 28 main process
+      │                        │
+      │                        ├── FFmpeg (export, audio mix, optimize)
+      │                        └── Python TTS server (LuxTTS / Qwen3-TTS)
+      └── Canvas 2D renderer (preview + export frame streaming)
+```
+
+- `src/store/ProjectContext.jsx` — reducer-based global state with undo/redo history.
+- `src/engine/` — `scriptParser`, `renderEngine`, `animationEngine`, `automationEngine`, `exportEngine`, `scriptImageMatcher`.
+- `electron/main.js` — window management, IPC handlers, FFmpeg/TTS process orchestration.
+- `scripts/voice_clone_server.py` — local TTS model server (`http://127.0.0.1:5555`).
+
+## 📁 Structure
+
+```
+├── electron/          # Main process + preload (context bridge)
 ├── src/
-│   ├── components/     # High-fidelity React UI components
-│   │   ├── TitleBar.jsx        # Frameless window controls and brand logo
-│   │   ├── Toolbar.jsx         # Selection tool triggers, timeline options
-│   │   ├── MediaLibrary.jsx    # Sound effects, backgrounds, and character assets
-│   │   ├── PreviewCanvas.jsx   # Interactive canvas rendering controls
-│   │   ├── ScriptEditor.jsx    # Text parser input and dialogue blocks
-│   │   ├── Timeline.jsx        # Waveform, audio, and visual tracks
-│   │   ├── ExportModal.jsx     # Resolution options & progress indicator
-│   │   └── ToastContainer.jsx  # Notification alert overlay
-│   ├── engine/         # Core logic processors
-│   │   ├── scriptParser.js     # Parses scripts using Regex patterns
-│   │   ├── animationEngine.js  # Runs mathematical tick-rates for pop/fade/slide
-│   │   └── exportEngine.js     # Generates command parameters for FFmpeg
-│   ├── store/
-│   │   └── ProjectContext.jsx  # Context-based global project state
-│   ├── styles/
-│   │   └── index.css           # Design tokens, variables, & component styles
-│   ├── App.jsx                 # Layout layout grids
-│   └── main.jsx                # DOM entry point
-├── scripts/
-│   └── wait-for-vite.js        # Prevents Electron from loading before Vite starts
-├── bin/                        # [Ignored] Folder for FFmpeg binary files
-└── package.json                # Project configurations & dependencies
+│   ├── components/    # Timeline, PreviewCanvas, ScriptEditor, MediaLibrary, ...
+│   ├── engine/        # Parsing, rendering, animation, automation, export logic
+│   ├── store/         # ProjectContext (state + history)
+│   ├── utils/         # fileHelpers, scriptImageMatcher
+│   ├── styles/        # CSS design tokens
+│   ├── App.jsx        # Main editor layout
+│   └── main.jsx       # Entry point (hash-routed windows)
+├── assets/            # App icon, default character voices
+├── presets/           # Voice/character/media preset libraries
+├── scripts/           # TTS server, dev/build helpers
+└── package.json
 ```
 
----
+## ⌨️ Shortcuts
 
-## 📋 Keyboard Shortcuts
-
-| Shortcut Key | Action |
+| Key | Action |
 |:---:|---|
-| <kbd>V</kbd> | Selection Tool |
-| <kbd>C</kbd> | Cut/Slice Tool |
-| <kbd>H</kbd> | Hand/Pan Tool |
-| <kbd>Space</kbd> | Play / Pause Preview |
-| <kbd>Delete</kbd> | Delete Selected Timeline Clip |
+| `V` / `C` / `H` | Select / Cut / Hand tools |
+| `Space` | Play / pause preview |
+| `Delete` | Delete selected clip |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
----
+## 📄 License
 
-## 🛡️ License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT

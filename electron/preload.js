@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // File operations
   openFileDialog: (options) => ipcRenderer.invoke('open-file-dialog', options),
+  openFolderDialog: (options) => ipcRenderer.invoke('open-folder-dialog', options),
   saveFileDialog: (options) => ipcRenderer.invoke('save-file-dialog', options),
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
   readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
@@ -66,5 +67,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   applyProjectSettings: (config) => ipcRenderer.invoke('apply-project-settings', config),
   onProjectSettingsUpdated: (callback) => ipcRenderer.on('project-settings-updated', (event, data) => callback(data)),
   removeProjectSettingsUpdated: () => ipcRenderer.removeAllListeners('project-settings-updated'),
+
+  // Graphics Creator Window
+  openGraphicsCreatorWindow: () => ipcRenderer.send('open-graphics-creator-window'),
+  addMediaToProject: (mediaItem) => ipcRenderer.invoke('add-media-to-project', mediaItem),
+  onMediaItemAdded: (callback) => ipcRenderer.on('media-item-added', (event, data) => callback(data)),
+  removeMediaItemAdded: () => ipcRenderer.removeAllListeners('media-item-added'),
 });
 

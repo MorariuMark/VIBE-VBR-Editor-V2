@@ -1,5 +1,6 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useProject } from '../store/ProjectContext';
+import { detectSilenceSegments, matchBlocksToSegments } from '../engine/scriptParser';
 import { getInterpolatedKeyframeTransform } from '../engine/animationEngine';
 import { formatTime, readFileAsDataUrl } from '../utils/fileHelpers';
 
@@ -89,19 +90,24 @@ export default function ScriptEditor({ onMinimize }) {
   const [selectedCharacterId, setSelectedCharacterId] = useState('');
   const [activeProp, setActiveProp] = useState('x'); // 'x' | 'y' | 'scale' | 'rotation' | 'opacity'
   const [draggingKf, setDraggingKf] = useState(null);
-  const textareaRef = useRef(null);
+  const blocksRef = useRef(null);
+  const lastTimeupdateRef = useRef(-1);
 
   const [customPresets, setCustomPresets] = useState([]);
   const [newPresetName, setNewPresetName] = useState('');
   const [defaultPreset, setDefaultPreset] = useState(null);
 
+  const loadCustomPresets = async () => {
+    if (window.electronAPI && window.electronAPI.loadCharacterPresets) {
+      const list = await window.electronAPI.loadCharacterPresets();
+      setCustomPresets(list || []);
+    }
+  };
+
   useEffect(() => {
     const initPresets = async () => {
       if (window.electronAPI) {
-        if (window.electronAPI.loadCharacterPresets) {
-          const list = await window.electronAPI.loadCharacterPresets();
-          setCustomPresets(list || []);
-        }
+        await loadCustomPresets();
 
         const projectPath = await window.electronAPI.getProjectPath();
         const projectPathNormalized = projectPath.replace(/\\/g, '/');
@@ -163,10 +169,21 @@ export default function ScriptEditor({ onMinimize }) {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') {
+        const activeEl = document.activeElement;
+        if (
+          activeEl &&
+          (activeEl.tagName === 'INPUT' ||
+            activeEl.tagName === 'TEXTAREA' ||
+            activeEl.tagName === 'BUTTON' ||
+            activeEl.tagName === 'SELECT' ||
+            activeEl.hasAttribute('contenteditable'))
+        ) {
           return;
         }
-        if (state.selectedElementId && state.selectedKeyframeIndex !== null) {
+        // Only handle the keyframe when no timeline clip is selected —
+        // otherwise App.jsx's Delete handler deletes the clip and both
+        // would fire for one press.
+        if (!state.selectedClipId && state.selectedElementId && state.selectedKeyframeIndex !== null) {
           const char = state.characters.find(c => c.id === state.selectedElementId);
           if (char && char.keyframes && char.keyframes[state.selectedKeyframeIndex]) {
             actions.removeCharacterKeyframe(char.id, state.selectedKeyframeIndex);
@@ -178,7 +195,7 @@ export default function ScriptEditor({ onMinimize }) {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [state.selectedElementId, state.selectedKeyframeIndex, state.characters]);
+  }, [state.selectedElementId, state.selectedKeyframeIndex, state.characters, state.selectedClipId]);
 
   // Auto-switch tabs when elements are selected
   useEffect(() => {
@@ -200,20 +217,28 @@ export default function ScriptEditor({ onMinimize }) {
     const onTimeUpdate = (e) => {
       const t = e.detail;
 
-      // 1. Update active dialogue block classes directly in DOM
-      const blocks = document.querySelectorAll('.dialogue-block');
-      blocks.forEach((el) => {
+      // Skip duplicate events within the same frame
+      if (t === lastTimeupdateRef.current) return;
+      lastTimeupdateRef.current = t;
+
+      // 1. Update active dialogue block classes directly in DOM.
+      // Block elements are cached on first lookup so the scan is O(1) per frame.
+      if (!blocksRef.current) {
+        blocksRef.current = Array.from(document.querySelectorAll('.dialogue-block'));
+      }
+      const blocks = blocksRef.current;
+      for (let i = 0; i < blocks.length; i++) {
+        const el = blocks[i];
         const start = parseFloat(el.getAttribute('data-start'));
         const duration = parseFloat(el.getAttribute('data-duration'));
         if (!isNaN(start) && !isNaN(duration)) {
-          const active = t >= start && t <= start + duration;
-          if (active) {
-            el.classList.add('dialogue-block--active');
-          } else {
-            el.classList.remove('dialogue-block--active');
+          const active = t >= start && t < start + duration;
+          const hasActive = el.classList.contains('dialogue-block--active');
+          if (active !== hasActive) {
+            el.classList.toggle('dialogue-block--active', active);
           }
         }
-      });
+      }
 
       // 2. Update animation graph playhead line directly in DOM
       const graphPlayhead = document.querySelector('.graph-playhead-line');
@@ -230,6 +255,11 @@ export default function ScriptEditor({ onMinimize }) {
     window.addEventListener('timeupdate', onTimeUpdate);
     return () => window.removeEventListener('timeupdate', onTimeUpdate);
   }, []);
+
+  // Invalidate the cached block list whenever the dialogue list re-renders
+  useEffect(() => {
+    blocksRef.current = null;
+  }, [state.dialogueBlocks]);
 
   const handleScriptChange = (e) => {
     actions.setScript(e.target.value);
@@ -333,7 +363,6 @@ export default function ScriptEditor({ onMinimize }) {
       
       actions.setAudioBuffer(audioBuffer);
       
-      const { detectSilenceSegments, matchBlocksToSegments } = await import('../engine/scriptParser');
       const segments = detectSilenceSegments(audioBuffer);
       
       if (segments.length > 0 && state.dialogueBlocks.length > 0) {
@@ -1826,6 +1855,33 @@ export default function ScriptEditor({ onMinimize }) {
                     />
                   </div>
                 </div>
+                <div className="form-row" style={{ marginTop: 4 }}>
+                  <div className="form-group" style={{ flex: 1 }}>
+                    <label className="form-label" style={{ fontSize: '9px' }}>Interpolation Easing</label>
+                    <select
+                      className="form-select"
+                      style={{ height: 22, padding: '0 4px', fontSize: '10px' }}
+                      value={sortedKfs[state.selectedKeyframeIndex].easing || 'linear'}
+                      onChange={(e) => {
+                        actions.updateCharacterKeyframe(character.id, state.selectedKeyframeIndex, { easing: e.target.value });
+                        actions.addToast(`Set easing to ${e.target.value}`, 'info');
+                      }}
+                    >
+                      <option value="linear">Linear (Constant)</option>
+                      <option value="smoothSpline">Smooth Spline Curve</option>
+                      <option value="easeInQuad">Ease In (Accelerate)</option>
+                      <option value="easeOutQuad">Ease Out (Decelerate)</option>
+                      <option value="easeInOutQuad">Ease In-Out (Smooth)</option>
+                      <option value="easeInCubic">Ease In (Cubic)</option>
+                      <option value="easeOutCubic">Ease Out (Cubic)</option>
+                      <option value="easeInOutCubic">Ease In-Out (Cubic)</option>
+                      <option value="easeInBack">Ease In (Anticipate Back)</option>
+                      <option value="easeOutBack">Ease Out (Overshoot Back)</option>
+                      <option value="easeOutBounce">Ease Out (Bounce Impact)</option>
+                      <option value="hold">Hold (Instant Step)</option>
+                    </select>
+                  </div>
+                </div>
                 <div className="form-row-slider" style={{ marginTop: 4 }}>
                   <input
                     type="range"
@@ -2251,7 +2307,6 @@ export default function ScriptEditor({ onMinimize }) {
           {activeTab === 'script' && (
             <>
               <textarea
-                ref={textareaRef}
                 className="script-textarea"
                 value={state.scriptText}
                 onChange={handleScriptChange}
@@ -2551,6 +2606,10 @@ export default function ScriptEditor({ onMinimize }) {
         };
       })
     };
+    if (!window.electronAPI || !window.electronAPI.saveCharacterPreset) {
+      actions.addToast('Preset saving requires the desktop app', 'error');
+      return;
+    }
     const res = await window.electronAPI.saveCharacterPreset(charPreset);
     if (res.success) {
       actions.addToast(`Preset "${charPreset.name}" saved successfully!`, 'success');
@@ -2560,8 +2619,11 @@ export default function ScriptEditor({ onMinimize }) {
       actions.addToast(`Failed to save preset: ${res.error}`, 'error');
     }
   }
-
   async function handleDeletePreset(name) {
+    if (!window.electronAPI || !window.electronAPI.deleteCharacterPreset) {
+      actions.addToast('Preset deletion requires the desktop app', 'error');
+      return;
+    }
     if (confirm(`Are you sure you want to delete preset "${name}"?`)) {
       const res = await window.electronAPI.deleteCharacterPreset(name);
       if (res.success) {

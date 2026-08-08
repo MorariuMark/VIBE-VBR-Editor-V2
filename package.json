@@ -2,6 +2,7 @@
   "name": "vibe-br-video-editor",
   "version": "1.0.0",
   "description": "Automated multi-character dialogue video editor for short-form brain rot content",
+  "author": "MorariuMark",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently \"npm run dev:vite\" \"npm run dev:electron\"",
@@ -17,17 +18,38 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
     "concurrently": "^8.2.2",
-    "electron": "^28.1.0",
+    "electron": "^28.3.3",
     "electron-builder": "^24.9.1",
+    "jimp": "^1.6.1",
+    "png-to-ico": "^3.0.2",
     "vite": "^5.0.12"
   },
   "build": {
     "appId": "com.vibebr.videoeditor",
     "productName": "VIBE-BR-Video Editor",
+    "icon": "assets/icon.png",
     "asar": true,
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "category": "Video",
+      "target": [
+        "AppImage",
+        "deb",
+        "snap",
+        "tar.gz"
+      ]
+    },
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
       "!dist/voices/**",
       "!dist/voice_temp/**"
     ],
@@ -35,7 +57,9 @@
       {
         "from": "assets",
         "to": "assets",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ]
   }

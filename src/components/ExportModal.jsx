@@ -11,6 +11,17 @@ export default function ExportModal() {
   const [selectedPreset, setSelectedPreset] = useState('tiktok-vertical');
   const [renderMethod, setRenderMethod] = useState('canvas');
   const cancelExportRef = useRef(false);
+  const presetTouchedRef = useRef(false);
+
+  // Default the preset from the project aspect when the modal opens, unless
+  // the user already picked one.
+  useEffect(() => {
+    if (state.showExportModal && !presetTouchedRef.current) {
+      const w = state.exportSettings.width || 1920;
+      const h = state.exportSettings.height || 1080;
+      setSelectedPreset(h >= w ? 'tiktok-vertical' : 'youtube-landscape');
+    }
+  }, [state.showExportModal, state.exportSettings.width, state.exportSettings.height]);
 
   const [supportedCodecs, setSupportedCodecs] = useState({
     h264_nvenc: false,
@@ -46,6 +57,7 @@ export default function ExportModal() {
   if (!state.showExportModal) return null;
 
   const handlePresetChange = (presetId) => {
+    presetTouchedRef.current = true;
     setSelectedPreset(presetId);
     const preset = EXPORT_PRESETS[presetId];
     if (preset) {
@@ -121,7 +133,10 @@ export default function ExportModal() {
         }
 
         if (renderMethod === 'native') {
-          // Listen to native export progress
+          // Listen to native export progress (dedupe: clear any prior listener)
+          if (window.electronAPI.removeExportProgress) {
+            window.electronAPI.removeExportProgress();
+          }
           window.electronAPI.onExportProgress((progressData) => {
             if (progressData && typeof progressData.percent === 'number') {
               actions.setExportProgress(progressData.percent);
@@ -155,8 +170,6 @@ export default function ExportModal() {
             totalDuration: state.totalDuration,
           });
 
-          window.electronAPI.removeExportProgress();
-
           if (result.success) {
             actions.addToast('Export complete!', 'success');
           } else {
@@ -182,9 +195,9 @@ export default function ExportModal() {
           }
         }
 
-        // Preload timeline image clips
+        // Preload timeline image clips (video, broll, & window tracks)
         for (const track of state.tracks) {
-          if (track.type === 'video') {
+          if (track.type === 'video' || track.type === 'broll' || track.type === 'window') {
             for (const clip of track.clips) {
               if (clip.type === 'image' && clip.dataUrl) {
                 await new Promise((resolve) => {
@@ -201,6 +214,28 @@ export default function ExportModal() {
           }
         }
 
+        // Preload per-clip video elements for video/broll/window tracks so
+        // drawFrame can render them during export (mirrors the preview)
+        const videoElements = {};
+        const videoClipsWithEls = [];
+        for (const track of state.tracks) {
+          if (track.type !== 'video' && track.type !== 'broll' && track.type !== 'window') continue;
+          for (const clip of track.clips) {
+            if (clip.type !== 'video' || videoElements[clip.id]) continue;
+            const el = document.createElement('video');
+            el.muted = true;
+            el.playsInline = true;
+            el.src = clip.dataUrl || `file:///${clip.path.replace(/\\/g, '/')}`;
+            videoElements[clip.id] = el;
+            videoClipsWithEls.push({ clip, el });
+          }
+        }
+        await Promise.all(videoClipsWithEls.map(({ el }) => new Promise((resolve) => {
+          el.onloadedmetadata = () => resolve();
+          el.onerror = () => resolve();
+          el.load();
+        })));
+
         // Setup temporary video element for background (only for slow CPU Canvas render)
         let tempVideo = null;
         if (renderMethod === 'canvas-cpu' && state.backgroundVideo) {
@@ -215,6 +250,7 @@ export default function ExportModal() {
             tempVideo.onerror = () => resolve();
             tempVideo.load();
           });
+          videoElements.clip_bg = tempVideo;
         }
 
         // Setup hidden export canvas
@@ -270,6 +306,14 @@ export default function ExportModal() {
             await seekVideo(tempVideo, time % vDur);
           }
 
+          // Seek any overlay/background video clips active at this time
+          for (const { clip, el } of videoClipsWithEls) {
+            if (time >= clip.startTime && time < clip.startTime + clip.duration) {
+              const vDur = el.duration || clip.duration || 1;
+              await seekVideo(el, (time - clip.startTime) % vDur);
+            }
+          }
+
           // Draw pixel-perfect frame
           drawFrame(exportCtx, {
             state,
@@ -277,7 +321,7 @@ export default function ExportModal() {
             width: exportCanvas.width,
             height: exportCanvas.height,
             loadedImages,
-            videoElement: tempVideo,
+            videoElement: videoElements,
             drawHandles: false,
             transparentBackground: renderMethod === 'canvas',
           });
@@ -298,8 +342,10 @@ export default function ExportModal() {
             }
           }
 
-          // Update progress
-          actions.setExportProgress((i / totalFrames) * 95); // 95% is frame processing
+          // Update progress (throttled: the slider only needs ~10 updates/sec)
+          if (i % 6 === 0 || i === totalFrames - 1) {
+            actions.setExportProgress((i / totalFrames) * 95); // 95% is frame processing
+          }
         }
 
         // Wait for all remaining background frame writes to complete
@@ -340,6 +386,9 @@ export default function ExportModal() {
       actions.addToast(`Export error: ${err.message}`, 'error');
     } finally {
       actions.setExporting(false);
+      if (window.electronAPI && window.electronAPI.removeExportProgress) {
+        window.electronAPI.removeExportProgress();
+      }
       if (tempAudioOutput && window.electronAPI && window.electronAPI.deleteFile) {
         await window.electronAPI.deleteFile(tempAudioOutput);
       }

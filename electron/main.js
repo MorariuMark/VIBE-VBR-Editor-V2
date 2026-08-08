@@ -1,7 +1,30 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
+
+// ─── Single home base: EVERYTHING lives inside the app's own folder.
+// Redirect Electron's userData (settings, projects, caches) so nothing is
+// ever written to %APPDATA% / C: drive. All data goes to <APP_ROOT>/userData.
+let APP_ROOT;
+try {
+  if (app.isPackaged) {
+    // Portable app installed inside the project folder:
+    // <APP_ROOT>/VIBE-BR-Video Editor/VIBE-BR-Video Editor.exe
+    const exeDir = path.dirname(app.getPath('exe'));
+    const parent = path.dirname(exeDir);
+    APP_ROOT = (fs.existsSync(path.join(parent, 'package.json')) || fs.existsSync(path.join(parent, '.venv')))
+      ? parent
+      : exeDir;
+  } else {
+    // Dev mode: main.js lives in <project>/electron/ -> root is one level up
+    APP_ROOT = path.join(__dirname, '..');
+  }
+  app.setPath('userData', path.join(APP_ROOT, 'userData'));
+  console.log(`[Main] App root: ${APP_ROOT} | userData: ${app.getPath('userData')}`);
+} catch (e) {
+  console.error('[Main] Failed to redirect userData:', e);
+}
 
 // Force dedicated GPU and ignore GPU blocklists
 app.commandLine.appendSwitch('force_high_performance_gpu');
@@ -29,55 +52,61 @@ if (!useGPU) {
 }
 
 function getFFmpegPath() {
-  const userProfile = process.env.USERPROFILE || 'C:\\Users\\morar';
+  const isWin = process.platform === 'win32';
+  const userProfile = process.env.USERPROFILE || process.env.HOME || '';
   
   const ffmpegPaths = [
     // 1. Local bin folder (project-specific)
-    path.join(__dirname, '..', 'bin', 'ffmpeg.exe'),
+    path.join(__dirname, '..', 'bin', isWin ? 'ffmpeg.exe' : 'ffmpeg'),
     path.join(__dirname, '..', 'bin', 'ffmpeg'),
 
-    // 2. Pinokio environments (highly recommended fallbacks on Windows)
+    // 2. Linux system paths
+    '/usr/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+    '/snap/bin/ffmpeg',
+
+    // 3. Windows environment fallbacks
     'E:\\pinokio_home\\bin\\miniconda\\Library\\bin\\ffmpeg.exe',
     'E:\\pinokio_home\\bin\\ffmpeg-env\\Library\\bin\\ffmpeg.exe',
     path.join(userProfile, 'pinokio', 'bin', 'miniconda', 'Library', 'bin', 'ffmpeg.exe'),
     path.join(userProfile, 'pinokio', 'bin', 'ffmpeg-env', 'Library', 'bin', 'ffmpeg.exe'),
     'C:\\pinokio_home\\bin\\miniconda\\Library\\bin\\ffmpeg.exe',
     'C:\\pinokio_home\\bin\\ffmpeg-env\\Library\\bin\\ffmpeg.exe',
-
-    // 3. Anaconda / Miniconda default locations
     path.join(userProfile, 'miniconda3', 'Library', 'bin', 'ffmpeg.exe'),
     path.join(userProfile, 'anaconda3', 'Library', 'bin', 'ffmpeg.exe'),
     'C:\\miniconda3\\Library\\bin\\ffmpeg.exe',
     'E:\\miniconda3\\Library\\bin\\ffmpeg.exe',
   ];
 
-  const localAppData = process.env.LOCALAPPDATA || path.join(userProfile, 'AppData', 'Local');
-  const wingetFolder = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
-  if (fs.existsSync(wingetFolder)) {
-    try {
-      const pkgs = fs.readdirSync(wingetFolder);
-      for (const pkg of pkgs) {
-        if (pkg.toLowerCase().includes('ffmpeg')) {
-          const pkgPath = path.join(wingetFolder, pkg);
-          const scanDirs = [pkgPath, path.join(pkgPath, 'bin')];
-          try {
-            const subdirs = fs.readdirSync(pkgPath);
-            for (const sub of subdirs) {
-              scanDirs.push(path.join(pkgPath, sub, 'bin'));
-              scanDirs.push(path.join(pkgPath, sub));
-            }
-          } catch (e) {}
-          
-          for (const dir of scanDirs) {
-            const exe = path.join(dir, 'ffmpeg.exe');
-            if (fs.existsSync(exe)) {
-              ffmpegPaths.push(exe);
+  if (isWin) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(userProfile, 'AppData', 'Local');
+    const wingetFolder = path.join(localAppData, 'Microsoft', 'WinGet', 'Packages');
+    if (fs.existsSync(wingetFolder)) {
+      try {
+        const pkgs = fs.readdirSync(wingetFolder);
+        for (const pkg of pkgs) {
+          if (pkg.toLowerCase().includes('ffmpeg')) {
+            const pkgPath = path.join(wingetFolder, pkg);
+            const scanDirs = [pkgPath, path.join(pkgPath, 'bin')];
+            try {
+              const subdirs = fs.readdirSync(pkgPath);
+              for (const sub of subdirs) {
+                scanDirs.push(path.join(pkgPath, sub, 'bin'));
+                scanDirs.push(path.join(pkgPath, sub));
+              }
+            } catch (e) {}
+            
+            for (const dir of scanDirs) {
+              const exe = path.join(dir, 'ffmpeg.exe');
+              if (fs.existsSync(exe)) {
+                ffmpegPaths.push(exe);
+              }
             }
           }
         }
+      } catch (err) {
+        console.error("Error scanning WinGet FFmpeg:", err);
       }
-    } catch (err) {
-      console.error("Error scanning WinGet FFmpeg:", err);
     }
   }
 
@@ -95,6 +124,19 @@ function getFFmpegPath() {
 
 let mainWindow;
 const isDev = !app.isPackaged;
+
+// Single instance lock: focus the existing window instead of spawning a second app
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 function cleanTemporaryArtifacts() {
   try {
@@ -136,6 +178,7 @@ function createWindow() {
     frame: false,
     titleBarStyle: 'hidden',
     backgroundColor: '#0a0a0f',
+    icon: path.join(__dirname, '..', 'assets', 'icon.ico'),
     fullscreen: false,
     show: false,
     webPreferences: {
@@ -150,6 +193,13 @@ function createWindow() {
     mainWindow.maximize();
     mainWindow.show();
   });
+
+  // Deny navigation away from the app and window.open popups
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const allowed = isDev ? url.startsWith('http://localhost:5173') : url.startsWith('file://');
+    if (!allowed) event.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
     console.log(`[Renderer Console] [Level ${level}] ${message} (${sourceId}:${line})`);
@@ -175,6 +225,7 @@ app.whenReady().then(() => {
 
 app.on('quit', () => {
   stopPythonServer();
+  killAllFFmpegProcesses();
 });
 
 app.on('window-all-closed', () => {
@@ -277,6 +328,36 @@ ipcMain.handle('open-file-dialog', async (event, options) => {
   return result.filePaths;
 });
 
+// Folder import dialog (scan folder for images)
+const FOLDER_IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif'];
+
+ipcMain.handle('open-folder-dialog', async (event, options) => {
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory'],
+      title: options?.title || 'Select Image Folder',
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true, folderPath: null, files: [] };
+    }
+
+    const folderPath = result.filePaths[0];
+    const entries = fs.readdirSync(folderPath, { withFileTypes: true });
+    const files = entries
+      .filter(e => e.isFile())
+      .map(e => {
+        const ext = path.extname(e.name).toLowerCase();
+        return { name: e.name, path: path.join(folderPath, e.name), ext };
+      })
+      .filter(f => FOLDER_IMAGE_EXTENSIONS.includes(f.ext))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+    return { canceled: false, folderPath, files };
+  } catch (err) {
+    return { canceled: false, folderPath: null, files: [], error: err.message };
+  }
+});
+
 // Save dialog
 ipcMain.handle('save-file-dialog', async (event, options) => {
   const result = await dialog.showSaveDialog(mainWindow, {
@@ -340,6 +421,22 @@ ipcMain.handle('get-file-info', async (event, filePath) => {
 let exportProcess = null;
 let exportStderr = '';
 let exportResolve = null;
+let auxiliaryProcesses = new Set();
+
+function killAuxiliaryProcesses() {
+  for (const proc of auxiliaryProcesses) {
+    try { proc.kill('SIGKILL'); } catch (e) {}
+  }
+  auxiliaryProcesses.clear();
+}
+
+function killAllFFmpegProcesses() {
+  if (exportProcess) {
+    try { exportProcess.kill('SIGKILL'); } catch (e) {}
+    exportProcess = null;
+  }
+  killAuxiliaryProcesses();
+}
 
 // FFmpeg export (Native FFmpeg Command)
 ipcMain.handle('export-video', async (event, { args, outputPath, totalDuration }) => {
@@ -413,6 +510,7 @@ ipcMain.handle('optimize-video', async (event, { filePath, duration }) => {
 
       console.log('[Main] Optimizing video:', ffmpegPath, args.join(' '));
       const proc = spawn(ffmpegPath, args);
+      auxiliaryProcesses.add(proc);
       let stderr = '';
 
       proc.stderr.on('data', (data) => {
@@ -434,6 +532,7 @@ ipcMain.handle('optimize-video', async (event, { filePath, duration }) => {
       });
 
       proc.on('close', (code) => {
+        auxiliaryProcesses.delete(proc);
         if (code === 0) {
           mainWindow?.webContents.send('optimize-progress', { percent: 100, filePath });
           resolve({ success: true, outputPath });
@@ -443,6 +542,7 @@ ipcMain.handle('optimize-video', async (event, { filePath, duration }) => {
       });
 
       proc.on('error', (err) => {
+        auxiliaryProcesses.delete(proc);
         resolve({ success: false, error: err.message });
       });
     } catch (err) {
@@ -584,9 +684,13 @@ ipcMain.handle('start-frame-export', async (event, { settings, audioPath, backgr
 ipcMain.handle('send-frame', async (event, buffer) => {
   return new Promise((resolve) => {
     if (exportProcess && exportProcess.stdin && exportProcess.stdin.writable) {
-      exportProcess.stdin.write(Buffer.from(buffer), (err) => {
-        resolve(!err);
-      });
+      try {
+        exportProcess.stdin.write(Buffer.from(buffer), (err) => {
+          resolve(!err);
+        });
+      } catch (err) {
+        resolve(false);
+      }
     } else {
       resolve(false);
     }
@@ -617,7 +721,14 @@ ipcMain.handle('kill-export', async () => {
         resolve({ success: false, error: err.message });
       }
     } else {
-      resolve({ success: false, error: 'No active export process' });
+      // Also kill any auxiliary ffmpeg (optimize/mix) still running
+      const hadAux = auxiliaryProcesses.size > 0;
+      killAuxiliaryProcesses();
+      if (!hadAux) {
+        resolve({ success: false, error: 'No active export process' });
+      } else {
+        resolve({ success: true });
+      }
     }
   });
 });
@@ -627,20 +738,63 @@ ipcMain.handle('kill-export', async () => {
 let pythonServerProcess = null;
 
 function startPythonServer() {
-  const pythonPath = path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe');
-  const serverScript = path.join(__dirname, '..', 'scripts', 'voice_clone_server.py');
+  const isWin = process.platform === 'win32';
+  const projectDir = APP_ROOT || path.join(__dirname, '..');
+  const serverScript = path.join(projectDir, 'scripts', 'voice_clone_server.py');
   
-  if (!fs.existsSync(pythonPath)) {
-    console.log('[Main] Python virtual environment (.venv) not found. Voice cloning will not be available until installed.');
+  if (!fs.existsSync(serverScript)) {
+    console.log(`[Main] voice_clone_server.py not found at ${serverScript}. Voice cloning will not be available.`);
     return;
   }
 
-  console.log('[Main] Starting Python Voice Cloning server...');
-  
+  // Fallback chain: project .venv -> bundled venv (resources) -> system python
+  const candidates = [];
+  if (isWin) {
+    candidates.push(
+      path.join(projectDir, '.venv', 'Scripts', 'python.exe'),
+      path.join(process.resourcesPath || '', '.venv', 'Scripts', 'python.exe'),
+      'python.exe',
+      'py.exe'
+    );
+  } else {
+    candidates.push(
+      path.join(projectDir, '.venv', 'bin', 'python'),
+      path.join(process.resourcesPath || '', '.venv', 'bin', 'python'),
+      'python3',
+      'python'
+    );
+  }
+
+  let pythonPath = null;
+  for (const cand of candidates) {
+    if (cand.includes(path.sep) && path.isAbsolute(cand) && fs.existsSync(cand)) {
+      pythonPath = cand;
+      break;
+    }
+    // On PATH
+    try {
+      const probe = spawnSync(cand, ['-c', 'import flask, torch; print("ok")'], { timeout: 15000, windowsHide: true, encoding: 'utf8' });
+      if (probe.status === 0 && probe.stdout && probe.stdout.toString().trim() === 'ok') {
+        pythonPath = cand;
+        break;
+      }
+    } catch (e) {
+      // try next candidate
+    }
+  }
+
+  if (!pythonPath) {
+    console.log('[Main] No Python with Flask+Torch found. Voice cloning will not be available until the TTS environment is installed (run install_voice_clone.bat).');
+    return;
+  }
+
+  console.log(`[Main] Starting Python Voice Cloning server using: ${pythonPath}`);
+
   // Set project-local cache path
-  const hfCachePath = path.join(__dirname, '..', '.hf_cache');
-  
+  const hfCachePath = path.join(projectDir, '.hf_cache');
+
   pythonServerProcess = spawn(pythonPath, [serverScript], {
+    cwd: projectDir,
     env: {
       ...process.env,
       HF_HOME: hfCachePath
@@ -653,6 +807,11 @@ function startPythonServer() {
 
   pythonServerProcess.stderr.on('data', (data) => {
     console.error(`[Python Server stderr] ${data.toString().trim()}`);
+  });
+
+  pythonServerProcess.on('error', (err) => {
+    console.error('[Main] Failed to start Python server:', err.message);
+    pythonServerProcess = null;
   });
 
   pythonServerProcess.on('close', (code) => {
@@ -737,6 +896,36 @@ function createVoiceCloneWindow() {
   });
 }
 
+let graphicsCreatorWindow = null;
+
+function createGraphicsCreatorWindow() {
+  graphicsCreatorWindow = new BrowserWindow({
+    width: 1280,
+    height: 850,
+    parent: mainWindow,
+    modal: false,
+    autoHideMenuBar: true,
+    title: 'Vector Graphics Studio',
+    icon: path.join(__dirname, '..', 'assets', 'icon.ico'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: false,
+    },
+  });
+
+  if (isDev) {
+    graphicsCreatorWindow.loadURL('http://localhost:5173/#/graphics-creator');
+  } else {
+    graphicsCreatorWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { hash: '/graphics-creator' });
+  }
+
+  graphicsCreatorWindow.on('closed', () => {
+    graphicsCreatorWindow = null;
+  });
+}
+
 // IPC Triggers
 ipcMain.on('open-voice-clone-window', () => {
   if (voiceCloneWindow) {
@@ -752,6 +941,14 @@ ipcMain.on('open-settings-window', () => {
     settingsWindow.focus();
   } else {
     createSettingsWindow();
+  }
+});
+
+ipcMain.on('open-graphics-creator-window', () => {
+  if (graphicsCreatorWindow) {
+    graphicsCreatorWindow.focus();
+  } else {
+    createGraphicsCreatorWindow();
   }
 });
 
@@ -784,6 +981,14 @@ ipcMain.handle('set-active-project-state', (event, state) => {
 
 ipcMain.handle('get-active-project-state', () => {
   return activeProjectState;
+});
+
+ipcMain.handle('add-media-to-project', async (event, mediaItem) => {
+  if (mainWindow) {
+    mainWindow.webContents.send('media-item-added', mediaItem);
+    return { success: true };
+  }
+  return { success: false, error: 'Main window not active' };
 });
 
 ipcMain.handle('apply-timeline-voices', async (event, payload) => {
@@ -1033,9 +1238,11 @@ ipcMain.handle('mix-audio-clips', async (event, { clips, outputPath }) => {
       
       console.log('[Main] Mix audio clips command:', ffmpegPath, args.join(' '));
       const proc = spawn(ffmpegPath, args);
+      auxiliaryProcesses.add(proc);
       let stderr = '';
       proc.stderr.on('data', (d) => { stderr += d.toString(); });
       proc.on('close', (code) => {
+        auxiliaryProcesses.delete(proc);
         if (code === 0) {
           resolve({ success: true, outputPath });
         } else {
@@ -1043,6 +1250,7 @@ ipcMain.handle('mix-audio-clips', async (event, { clips, outputPath }) => {
         }
       });
       proc.on('error', (err) => {
+        auxiliaryProcesses.delete(proc);
         resolve({ success: false, error: err.message });
       });
     } catch (err) {

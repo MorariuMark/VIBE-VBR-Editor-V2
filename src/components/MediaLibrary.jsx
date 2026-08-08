@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useProject } from '../store/ProjectContext';
-import { getMediaType, readFileAsDataUrl } from '../utils/fileHelpers';
+import { getMediaType, readFileAsDataUrl, uid } from '../utils/fileHelpers';
+import HoverMenuItem from './HoverMenuItem';
 
 const getVideoDuration = (dataUrl) => {
   return new Promise((resolve) => {
@@ -30,33 +31,11 @@ const getAudioDuration = (dataUrl) => {
   });
 };
 
-function HoverMenuItem({ text, onClick, color }) {
-  const [hover, setHover] = useState(false);
-  return (
-    <div
-      style={{
-        padding: '8px 12px',
-        fontSize: '12px',
-        cursor: 'pointer',
-        color: color || '#e3e3e8',
-        background: hover ? 'rgba(255, 255, 255, 0.08)' : 'transparent',
-        transition: 'background 0.2s',
-      }}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onClick={onClick}
-    >
-      {text}
-    </div>
-  );
-}
-
 /**
  * Media Library Panel - holds imported video clips, character PNGs, and audio
  * and a standard global Media Preset Library
  */
-export default function MediaLibrary({ onMinimize }) {
-  const { state, actions, dispatch } = useProject();
+export default function MediaLibrary({ onMinimize }) {  const { state, actions, dispatch } = useProject();
   const [activeTab, setActiveTab] = useState('all');
   const [optimizing, setOptimizing] = useState({});
   const [contextMenu, setContextMenu] = useState(null); // { x, y, item }
@@ -131,7 +110,7 @@ export default function MediaLibrary({ onMinimize }) {
             duration = await getAudioDuration(dataUrl);
           }
           const item = {
-            id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_${uid()}`,
             name: fileData.name,
             path: fileData.path,
             ext,
@@ -160,7 +139,7 @@ export default function MediaLibrary({ onMinimize }) {
             duration = await getAudioDuration(dataUrl);
           }
           const item = {
-            id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_${uid()}`,
             name: file.name,
             path: file.name,
             ext,
@@ -171,6 +150,74 @@ export default function MediaLibrary({ onMinimize }) {
           actions.addMedia(item);
           actions.addToast(`Imported: ${file.name}`, 'success');
         }
+      };
+      input.click();
+    }
+  };
+
+  const handleApplyAllImages = () => {
+    const items = (state.mediaItems || []).filter(m => m.type === 'image');
+    if (items.length === 0) {
+      actions.addToast('No images in the media library yet.', 'warning');
+      return;
+    }
+    actions.applyImagesToTimeline(items);
+    actions.addToast(`Applied ${items.length} images to the timeline in order`, 'success');
+  };
+
+  const handleImportFolder = async () => {
+    if (window.electronAPI && window.electronAPI.openFolderDialog) {
+      const res = await window.electronAPI.openFolderDialog();
+      if (!res || res.canceled) return;
+      if (res.error) {
+        actions.addToast(`Failed to read folder: ${res.error}`, 'error');
+        return;
+      }
+      if (!res.files || res.files.length === 0) {
+        actions.addToast('No images found in the selected folder.', 'warning');
+        return;
+      }
+
+      const items = res.files.map(f => ({
+        id: `media_${Date.now()}_${uid()}`,
+        name: f.name,
+        path: f.path,
+        ext: f.ext,
+        dataUrl: `file:///${f.path.replace(/\\/g, '/')}`,
+        type: 'image',
+      }));
+
+      actions.importImageFolder(items);
+      actions.addToast(`Imported ${items.length} images to the media library`, 'success');
+    } else {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.webkitdirectory = true;
+      input.onchange = async (e) => {
+        const files = Array.from(e.target.files)
+          .filter(f => getMediaType('.' + f.name.split('.').pop().toLowerCase()) === 'image')
+          .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+        if (files.length === 0) {
+          actions.addToast('No images found in the selected folder.', 'warning');
+          return;
+        }
+
+        const items = [];
+        for (const file of files) {
+          const dataUrl = await readFileAsDataUrl(file);
+          items.push({
+            id: `media_${Date.now()}_${uid()}`,
+            name: file.name,
+            path: file.name,
+            ext: '.' + file.name.split('.').pop().toLowerCase(),
+            dataUrl,
+            type: 'image',
+          });
+        }
+
+        actions.importImageFolder(items);
+        actions.addToast(`Imported ${items.length} images to the media library`, 'success');
       };
       input.click();
     }
@@ -210,7 +257,7 @@ export default function MediaLibrary({ onMinimize }) {
       if (result.success) {
         // Add the optimized item to the media library using its local path URL directly
         const optimizedItem = {
-          id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: `media_${Date.now()}_${uid()}`,
           name: `${item.name.split('.')[0]}_optimized.mp4`,
           path: result.outputPath,
           ext: '.mp4',
@@ -487,7 +534,7 @@ export default function MediaLibrary({ onMinimize }) {
     if (existing) return existing;
 
     const newItem = {
-      id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `media_${Date.now()}_${uid()}`,
       name: presetItem.name,
       path: presetItem.path,
       ext: presetItem.ext,
@@ -579,6 +626,24 @@ export default function MediaLibrary({ onMinimize }) {
               <button className="panel__action-btn" onClick={handleImport} title="Import Files" style={{ width: 22, height: 22, fontSize: 13, fontWeight: 'bold' }}>
                 +
               </button>
+              <button
+                className="panel__action-btn"
+                onClick={handleImportFolder}
+                title="Import Folder of Images (adds to Media Library)"
+                style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              </button>
+              {state.mediaItems.some(m => m.type === 'image') && (
+                <button
+                  className="panel__action-btn"
+                  onClick={handleApplyAllImages}
+                  title="Apply All Images to Timeline (in order)"
+                  style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+                </button>
+              )}
             </div>
           </div>
 

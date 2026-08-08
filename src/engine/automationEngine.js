@@ -7,6 +7,9 @@
  */
 
 // ─── TTS Server Config ───
+import { drawFrame } from './renderEngine.js';
+import { DEFAULT_TEXT_STYLE } from './scriptParser.js';
+
 const TTS_SERVER = 'http://127.0.0.1:5555';
 
 const MODEL_NAMES = {
@@ -584,7 +587,7 @@ export function createExecutor(actions, getState, log) {
         updatedBlocks[i].duration = data.duration;
         updatedBlocks[i].words = data.words || [];
 
-        log(`   ✓ Generated ${data.duration.toFixed(2)}s clip. Applying to timeline...`, 'success');
+        log(`   ✓ Generated ${typeof data.duration === 'number' ? data.duration.toFixed(2) + 's' : '?'} clip. Applying to timeline...`, 'success');
 
         // Apply this single voice clip immediately
         if (window.electronAPI?.applyTimelineVoices) {
@@ -858,8 +861,7 @@ export function createExecutor(actions, getState, log) {
         }
       }
 
-      // Preload character images
-      const { drawFrame } = await import('./renderEngine.js');
+      // Render frame onto canvas using renderEngine drawFrame
 
       const loadedImages = {};
       for (const char of state.characters) {
@@ -897,6 +899,9 @@ export function createExecutor(actions, getState, log) {
 
       const fps = exportSettings.fps;
       const totalFrames = Math.ceil(state.totalDuration * fps);
+      if (totalFrames <= 0) {
+        throw new Error('Cannot render: project duration is 0. Set a background video or parse a script first.');
+      }
 
       log(`   Total frames: ${totalFrames} (${state.totalDuration.toFixed(2)}s)`, 'info');
 
@@ -1077,7 +1082,6 @@ export function createExecutor(actions, getState, log) {
         throw new Error(`Character "${charName}" not found for setting style.`);
       }
 
-      const { DEFAULT_TEXT_STYLE } = await import('./scriptParser.js');
       const currentStyle = char.textStyle || { ...DEFAULT_TEXT_STYLE };
       const updatedStyle = { ...currentStyle };
 
@@ -1224,11 +1228,14 @@ export function createExecutor(actions, getState, log) {
 
     let ip = 0;
     const variables = {};
+    let loopBudget = 0;
 
     while (ip < commands.length) {
       checkAbort();
       const cmd = commands[ip];
+      const currentLine = cmd.line;
 
+      try {
       // Perform variable substitution
       let resolvedArgs = cmd.args || '';
       resolvedArgs = resolvedArgs.replace(/\$(\w+)|\$\{(\w+)\}/g, (match, p1, p2) => {
@@ -1273,6 +1280,12 @@ export function createExecutor(actions, getState, log) {
           throw new Error(`FOR command range must be valid integers (line ${cmd.line})`);
         }
 
+        // Cap the iteration count to protect against runaway/huge loops
+        const MAX_LOOP_ITERATIONS = 10000;
+        if (endVal < startVal || (endVal - startVal) >= MAX_LOOP_ITERATIONS) {
+          throw new Error(`FOR loop range (${startVal} TO ${endVal}) exceeds the ${MAX_LOOP_ITERATIONS} iteration limit (line ${cmd.line})`);
+        }
+
         if (!variables.hasOwnProperty(varName)) {
           variables[varName] = startVal;
         }
@@ -1287,6 +1300,12 @@ export function createExecutor(actions, getState, log) {
       }
 
       if (cmd.command === 'ENDFOR') {
+        // Global budget guard: caps total loop iterations across all loops
+        // (protects against nested loops multiplying past the per-loop cap)
+        loopBudget++;
+        if (loopBudget > 100000) {
+          throw new Error(`Loop iteration budget exceeded (100000) — possible infinite loop (line ${cmd.line})`);
+        }
         const forIp = jumpTargets[ip];
         const forCmd = commands[forIp];
         const spaceIdx = forCmd.args.indexOf('=');
@@ -1364,6 +1383,14 @@ export function createExecutor(actions, getState, log) {
           return { success: false, aborted: true };
         }
         log(`❌ Error in ${cmd.command}: ${err.message}`, 'error');
+        return { success: false, error: err.message };
+      }
+      } catch (err) {
+        if (aborted || err.message === 'ABORTED') {
+          log('⛔ Execution aborted.', 'error');
+          return { success: false, aborted: true };
+        }
+        log(`❌ Error at line ${currentLine}: ${err.message}`, 'error');
         return { success: false, error: err.message };
       }
     }

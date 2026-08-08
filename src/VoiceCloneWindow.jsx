@@ -11,6 +11,7 @@ export default function VoiceCloneWindow() {
   const [selectedModel, setSelectedModel] = useState('luxtts');
   const [autoUnload, setAutoUnload] = useState(false); // false = keep model in VRAM after generation
   const [modelInstalled, setModelInstalled] = useState({ luxtts: false, 'qwen3tts_0.6b': false, 'qwen3tts_1.7b': false });
+  const [modelsList, setModelsList] = useState([]); // auto-detected models from /list_models
   const [downloadingState, setDownloadingState] = useState({ downloading: false, model_name: null, progress: 0, error: null });
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(null); // 'luxtts' | 'qwen3tts_0.6b' | 'qwen3tts_1.7b' | null
 
@@ -34,6 +35,18 @@ export default function VoiceCloneWindow() {
       }
     } catch (e) {
       console.error("Error fetching model status", e);
+    }
+  };
+
+  const fetchModelsList = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:5555/list_models');
+      if (res.ok) {
+        const data = await res.json();
+        setModelsList(Array.isArray(data.models) ? data.models : []);
+      }
+    } catch (e) {
+      console.error("Error fetching model list", e);
     }
   };
   const [splitPercent, setSplitPercent] = useState(60); // left panel % width
@@ -230,6 +243,7 @@ export default function VoiceCloneWindow() {
           }
           setServerStatus('Online');
           fetchModelInstalledStatus();
+          fetchModelsList();
         } else {
           setServerOnline(false);
           setServerStatus('Error');
@@ -262,7 +276,7 @@ export default function VoiceCloneWindow() {
         if (!active) return;
         if (res.ok) {
           const data = await res.json();
-          const progressPct = data.total_bytes > 0 ? Math.round((data.downloaded_bytes / data.total_bytes) * 100) : 0;
+          const progressPct = data.total_bytes > 0 ? Math.min(100, Math.round((data.downloaded_bytes / data.total_bytes) * 100)) : 0;
           
           setDownloadingState({
             downloading: data.downloading,
@@ -275,6 +289,7 @@ export default function VoiceCloneWindow() {
             clearInterval(pollInterval);
             pollInterval = null;
             fetchModelInstalledStatus();
+            fetchModelsList();
           }
         }
       } catch (err) {
@@ -503,19 +518,31 @@ export default function VoiceCloneWindow() {
 
   const handleApplyResult = async () => {
     if (!generatedResult || !generatedResult.dialogueBlocks) return;
+
+    if (redoBlockId && (!redoClipId || !redoTrackId)) {
+      addLog("Fatal Error: Invalid redo payload (missing clip/track ids). Discard and re-generate.");
+      return;
+    }
     
     addLog("Media Library: Sending generated audio clips to Media Library...");
     try {
       if (window.electronAPI && window.electronAPI.applyTimelineVoices) {
-        const voices = generatedResult.dialogueBlocks.map((block, idx) => ({
-          audioPath: block.wavPath,
-          characterName: block.characterName,
-          blockId: block.id,
-          characterId: block.characterId,
-          duration: block.duration,
-          index: idx,
-          words: block.words || [],
-        }));
+        const voices = generatedResult.dialogueBlocks
+          .filter(block => !!block.wavPath)
+          .map((block, idx) => ({
+            audioPath: block.wavPath,
+            characterName: block.characterName,
+            blockId: block.id,
+            characterId: block.characterId,
+            duration: block.duration,
+            index: idx,
+            words: block.words || [],
+          }));
+
+        if (voices.length === 0) {
+          addLog("Fatal Error: No generated audio paths available. Discard and re-generate.");
+          return;
+        }
 
         const syncRes = await window.electronAPI.applyTimelineVoices({
           voices,
@@ -1140,25 +1167,36 @@ export default function VoiceCloneWindow() {
                   <option value="luxtts">LuxTTS 1.7B Distilled (~1 GB VRAM)</option>
                   <option value="qwen3tts_0.6b">Qwen3-TTS 0.6B Base (~3 GB VRAM)</option>
                   <option value="qwen3tts_1.7b">Qwen3-TTS 1.7B Base (~6 GB VRAM)</option>
+                  {(modelsList.length > 0 ? modelsList.filter(m => m.id !== 'luxtts' && m.id !== 'qwen3tts_0.6b' && m.id !== 'qwen3tts_1.7b') : []).map(m => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
                 </select>
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                {(() => {
+                  const selInfo = modelsList.find(m => m.id === selectedModel) || {};
+                  const selInstalled = !!modelInstalled[selectedModel] || !!selInfo.installed;
+                  const selHfCached = !!selInfo.hf_cached;
+                  const statusText = selInstalled ? 'Installed' : (selHfCached ? 'In HF Cache' : 'Not Installed');
+                  const statusColor = selInstalled ? 'var(--accent-success, #00e676)' : (selHfCached ? '#00b0ff' : 'var(--accent-warning, #ffab40)');
+                  return (
+                  <>
                 <span style={{
                   fontSize: '9px',
                   padding: '1px 4px',
                   borderRadius: '3px',
                   fontWeight: '600',
-                  background: modelInstalled[selectedModel] ? 'rgba(0, 230, 118, 0.1)' : 'rgba(255, 171, 64, 0.1)',
-                  color: modelInstalled[selectedModel] ? 'var(--accent-success, #00e676)' : 'var(--accent-warning, #ffab40)',
-                  border: `1px solid ${modelInstalled[selectedModel] ? 'rgba(0, 230, 118, 0.2)' : 'rgba(255, 171, 64, 0.2)'}`,
+                  background: selInstalled || selHfCached ? 'rgba(0, 176, 255, 0.1)' : 'rgba(255, 171, 64, 0.1)',
+                  color: statusColor,
+                  border: `1px solid ${statusColor}33`,
                   display: 'inline-flex',
                   alignItems: 'center'
                 }}>
-                  {modelInstalled[selectedModel] ? 'Installed' : 'Not Installed'}
+                  {statusText}
                 </span>
 
-                {modelInstalled[selectedModel] ? (
+                {selInstalled ? (
                   <button
                     onClick={() => setShowUninstallConfirm(selectedModel)}
                     title="Uninstall model from this PC"
@@ -1227,6 +1265,9 @@ export default function VoiceCloneWindow() {
                     </button>
                   )
                 )}
+                  </>
+                  );
+                })()}
               </div>
 
               <div className="status-indicator">
@@ -1260,8 +1301,8 @@ export default function VoiceCloneWindow() {
                   className="btn btn--accent" 
                   style={{ padding: '2px 6px', fontSize: '10px' }}
                   onClick={handleLoadModel} 
-                  disabled={loadingModel || generating || !modelInstalled[selectedModel] || downloadingState.downloading}
-                  title={!modelInstalled[selectedModel] ? "Please download the model first" : "Load model into VRAM"}
+                  disabled={loadingModel || generating || (!modelInstalled[selectedModel] && !((modelsList.find(m => m.id === selectedModel) || {}).hf_cached)) || downloadingState.downloading}
+                  title={(!modelInstalled[selectedModel] && !((modelsList.find(m => m.id === selectedModel) || {}).hf_cached)) ? "Please download the model first" : "Load model into VRAM"}
                 >
                   {loadingModel ? 'Loading...' : 'Preload Model'}
                 </button>

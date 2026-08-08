@@ -1,20 +1,18 @@
-import React, { useState, useEffect } from 'react';
-
 const ASPECT_RATIO_PRESETS = [
-  { name: 'Vertical Portrait (9:16) [Default]', width: 1080, height: 1920, ratio: 9/16 },
-  { name: 'Landscape (16:9)', width: 1920, height: 1080, ratio: 16/9 },
+  { name: 'Landscape (16:9) [Default]', width: 1920, height: 1080, ratio: 16/9 },
+  { name: 'Vertical Portrait (9:16)', width: 1080, height: 1920, ratio: 9/16 },
   { name: 'Square (1:1)', width: 1080, height: 1080, ratio: 1/1 },
   { name: 'Standard (4:3)', width: 1440, height: 1080, ratio: 4/3 },
   { name: 'Classic Portrait (2:3)', width: 1080, height: 1620, ratio: 2/3 },
 ];
 
 export default function ProjectSettingsWindow() {
-  const [width, setWidth] = useState(1080);
-  const [height, setHeight] = useState(1920);
+  const [width, setWidth] = useState(1920);
+  const [height, setHeight] = useState(1080);
   const [fps, setFps] = useState(60);
   const [brollLayout, setBrollLayout] = useState('none');
   const [aspectRatioLock, setAspectRatioLock] = useState(true);
-  const [preset, setPreset] = useState('0'); // vertical portrait index
+  const [preset, setPreset] = useState('0'); // landscape 16:9 index
 
   const [brollX, setBrollX] = useState(50);
   const [brollY, setBrollY] = useState(20);

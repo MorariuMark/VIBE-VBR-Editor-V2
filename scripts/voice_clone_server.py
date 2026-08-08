@@ -127,6 +127,114 @@ def check_model_installed(model_name):
         return True
     return False
 
+# ─── Auto-detection of installed models ─────────────────────
+# Scans the project-local "models/" directory AND the local Hugging Face
+# cache (.hf_cache/hub) so any model the user has on disk is automatically
+# discovered and offered in the UI — no hardcoded lists.
+
+MODELS_DIR = os.path.join(project_dir, "models")
+HF_HUB_DIR = os.path.join(project_dir, ".hf_cache", "hub")
+
+MODEL_INFO = {
+    "luxtts": {
+        "name": "LuxTTS 1.7B",
+        "type": "luxtts",
+        "repo_id": "YatharthS/LuxTTS",
+        "local_dir": "luxtts",
+    },
+    "qwen3tts_0.6b": {
+        "name": "Qwen3-TTS 0.6B",
+        "type": "qwen3tts",
+        "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "local_dir": "qwen3tts",
+    },
+    "qwen3tts_1.7b": {
+        "name": "Qwen3-TTS 1.7B",
+        "type": "qwen3tts",
+        "repo_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "local_dir": "qwen3tts_1.7b",
+    },
+}
+
+def _dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+def hf_cache_snapshot_path(repo_id):
+    cache_dir = os.path.join(HF_HUB_DIR, "models--" + repo_id.replace("/", "--"))
+    if not os.path.isdir(cache_dir):
+        return None
+    snap = os.path.join(cache_dir, "snapshots")
+    if os.path.isdir(snap):
+        snapshots = [d for d in os.listdir(snap) if os.path.isdir(os.path.join(snap, d))]
+        if snapshots:
+            return os.path.join(snap, snapshots[0])
+    return cache_dir
+
+def scan_installed_models():
+    """Auto-detect every known model: local models/ dir + HF cache."""
+    result = {}
+    for mid, info in MODEL_INFO.items():
+        entry = {
+            "installed": False, "local": False, "hf_cached": False,
+            "size_bytes": 0, "path": None
+        }
+        if check_model_installed(mid):
+            local_dir = os.path.join(MODELS_DIR, info["local_dir"])
+            entry["installed"] = True
+            entry["local"] = True
+            entry["size_bytes"] = _dir_size(local_dir)
+            entry["path"] = local_dir
+        hf_path = hf_cache_snapshot_path(info["repo_id"])
+        if hf_path:
+            entry["hf_cached"] = True
+            if not entry["installed"]:
+                entry["size_bytes"] = max(entry["size_bytes"], _dir_size(hf_path))
+                entry["path"] = hf_path
+        result[mid] = entry
+    return result
+
+def scan_hf_cache_extras():
+    """List any other models present in the HF cache (unknown repos)."""
+    extras = []
+    known_repos = {info["repo_id"] for info in MODEL_INFO.values()}
+    if not os.path.isdir(HF_HUB_DIR):
+        return extras
+    try:
+        for name in os.listdir(HF_HUB_DIR):
+            if not name.startswith("models--"):
+                continue
+            repo_id = name[len("models--"):].replace("--", "/")
+            if repo_id in known_repos:
+                continue
+            snapshot = hf_cache_snapshot_path(repo_id)
+            if not snapshot:
+                continue
+            has_weights = any(f.endswith((".safetensors", ".bin", ".pt", ".onnx"))
+                              for _, _, files in os.walk(snapshot) for f in files)
+            if not has_weights:
+                continue
+            extras.append({
+                "id": f"hf:{repo_id}",
+                "name": repo_id,
+                "type": "hfcache",
+                "installed": True,
+                "hf_cached": True,
+                "size_bytes": _dir_size(snapshot),
+                "path": snapshot,
+                "loaded": False,
+                "downloadable": False,
+            })
+    except OSError as e:
+        print(f"[Python Server] HF cache scan failed: {e}", flush=True)
+    return extras
+
 def download_model_thread(model_name):
     global download_state
     try:
@@ -203,17 +311,27 @@ def download_model_thread(model_name):
             
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             
-            print(f"[Download Thread] Downloading {filename}...", flush=True)
-            response = requests.get(url, stream=True, allow_redirects=True, timeout=30)
-            if response.status_code != 200:
-                raise Exception(f"Failed to download {filename}: HTTP status {response.status_code}")
-                
-            with open(target_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        with download_lock:
-                            download_state["downloaded_bytes"] += len(chunk)
+            attempts = 0
+            while True:
+                attempts += 1
+                try:
+                    print(f"[Download Thread] Downloading {filename} (attempt {attempts})...", flush=True)
+                    response = requests.get(url, stream=True, allow_redirects=True, timeout=60)
+                    if response.status_code != 200:
+                        raise Exception(f"HTTP status {response.status_code}")
+                        
+                    with open(target_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=1024*1024):
+                            if chunk:
+                                f.write(chunk)
+                                with download_lock:
+                                    download_state["downloaded_bytes"] += len(chunk)
+                    break
+                except Exception as e:
+                    if attempts >= 4:
+                        raise Exception(f"Failed to download {filename} after {attempts} attempts: {str(e)}")
+                    print(f"[Download Thread] Retry {attempts}/4 for {filename}: {str(e)}", flush=True)
+                    time.sleep(5)
                             
         print(f"[Download Thread] Download of {model_name} completed successfully!", flush=True)
         with download_lock:
@@ -229,11 +347,29 @@ def download_model_thread(model_name):
 
 @app.route("/model_status", methods=["GET"])
 def get_model_status():
-    return jsonify({
-        "luxtts": check_model_installed("luxtts"),
-        "qwen3tts_0.6b": check_model_installed("qwen3tts_0.6b"),
-        "qwen3tts_1.7b": check_model_installed("qwen3tts_1.7b")
-    })
+    scan = scan_installed_models()
+    return jsonify({mid: e["installed"] for mid, e in scan.items()})
+
+@app.route("/list_models", methods=["GET"])
+def list_models():
+    scan = scan_installed_models()
+    models = []
+    for mid, info in MODEL_INFO.items():
+        e = scan[mid]
+        models.append({
+            "id": mid,
+            "name": info["name"],
+            "type": info["type"],
+            "installed": e["installed"],
+            "local": e["local"],
+            "hf_cached": e["hf_cached"],
+            "size_bytes": e["size_bytes"],
+            "path": e["path"],
+            "loaded": model is not None and model_type == mid,
+            "downloadable": True,
+        })
+    models.extend(scan_hf_cache_extras())
+    return jsonify({"models": models})
 
 @app.route("/download_model", methods=["POST"])
 def download_model():
@@ -630,4 +766,5 @@ def concatenate_voices():
 if __name__ == "__main__":
     # Start server on local port 5555
     print("[Python Server] Starting Flask Voice Cloning Server on port 5555...", flush=True)
-    app.run(host="127.0.0.1", port=5555, debug=False)
+    print(f"[Python Server] Auto-detected models: {json.dumps(scan_installed_models(), indent=2)}", flush=True)
+    app.run(host="127.0.0.1", port=5555, debug=False, threaded=True)

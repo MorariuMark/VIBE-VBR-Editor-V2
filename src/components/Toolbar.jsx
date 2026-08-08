@@ -1,6 +1,6 @@
 import React from 'react';
 import { useProject } from '../store/ProjectContext';
-import { getMediaType, readFileAsDataUrl } from '../utils/fileHelpers';
+import { getMediaType, readFileAsDataUrl, uid } from '../utils/fileHelpers';
 
 /**
  * Main toolbar with editing tools and action buttons
@@ -70,7 +70,7 @@ export default function Toolbar({ onToggleConsole, isConsoleOpen }) {
           const ext = fileData.ext;
           const type = getMediaType(ext);
           const item = {
-            id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_${uid()}`,
             name: fileData.name,
             path: fileData.path,
             ext,
@@ -99,7 +99,7 @@ export default function Toolbar({ onToggleConsole, isConsoleOpen }) {
         for (const file of e.target.files) {
           const dataUrl = await readFileAsDataUrl(file);
           const item = {
-            id: `media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: `media_${Date.now()}_${uid()}`,
             name: file.name,
             path: file.name,
             ext: '.' + file.name.split('.').pop().toLowerCase(),
@@ -233,6 +233,17 @@ export default function Toolbar({ onToggleConsole, isConsoleOpen }) {
       <div className="toolbar__group">
         <button
           className="toolbar__btn"
+          onClick={() => {
+            actions.resetProject();
+            actions.addToast('Started a new project — choose a preset', 'info');
+          }}
+          title="New Project (choose a new preset)"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 4 }}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          New
+        </button>
+        <button
+          className="toolbar__btn"
           onClick={handleSettingsOpen}
           title="Project Settings"
         >
@@ -263,6 +274,20 @@ export default function Toolbar({ onToggleConsole, isConsoleOpen }) {
         <button className="toolbar__btn" onClick={handleVoiceCloneOpen} title="AI Voice Clone & TTS">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 4 }}><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
           Voice Clone
+        </button>
+        <button
+          className="toolbar__btn"
+          onClick={() => {
+            if (window.electronAPI && window.electronAPI.openGraphicsCreatorWindow) {
+              window.electronAPI.openGraphicsCreatorWindow();
+            } else {
+              window.open('#/graphics-creator', '_blank', 'width=1280,height=850');
+            }
+          }}
+          title="Vector Graphics Studio (Illustrator & SVG Console)"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 4 }}><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+          Vector Studio
         </button>
       </div>
 

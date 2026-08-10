@@ -10,10 +10,18 @@ export default function VoiceCloneWindow() {
   const [unloadingModel, setUnloadingModel] = useState(false);
   const [selectedModel, setSelectedModel] = useState('luxtts');
   const [autoUnload, setAutoUnload] = useState(false); // false = keep model in VRAM after generation
-  const [modelInstalled, setModelInstalled] = useState({ luxtts: false, 'qwen3tts_0.6b': false, 'qwen3tts_1.7b': false });
+  const [modelInstalled, setModelInstalled] = useState({ luxtts: false, 'qwen3tts_0.6b': false, 'qwen3tts_1.7b': false, s2pro: false });
   const [modelsList, setModelsList] = useState([]); // auto-detected models from /list_models
   const [downloadingState, setDownloadingState] = useState({ downloading: false, model_name: null, progress: 0, error: null });
-  const [showUninstallConfirm, setShowUninstallConfirm] = useState(null); // 'luxtts' | 'qwen3tts_0.6b' | 'qwen3tts_1.7b' | null
+  const [showUninstallConfirm, setShowUninstallConfirm] = useState(null); // model id | null
+
+  // S2 Pro engine settings (s2.cpp CLI)
+  const [topP, setTopP] = useState(0.8);
+  const [topK, setTopK] = useState(30);
+  const [maxTokens, setMaxTokens] = useState(1024);
+  const [gpuLayers, setGpuLayers] = useState(-1); // -1 = auto
+  const [codecCpu, setCodecCpu] = useState(false);
+  const [s2Backend, setS2Backend] = useState('auto'); // auto | cpu | cuda | vulkan
 
   // Redo mode states
   const [redoBlockId, setRedoBlockId] = useState(null);
@@ -23,7 +31,25 @@ export default function VoiceCloneWindow() {
   const MODEL_NAMES = {
     luxtts: 'LuxTTS 1.7B',
     'qwen3tts_0.6b': 'Qwen3-TTS 0.6B',
-    'qwen3tts_1.7b': 'Qwen3-TTS 1.7B'
+    'qwen3tts_1.7b': 'Qwen3-TTS 1.7B',
+    s2pro: 'S2 Pro 5B (Q4_K_M)'
+  };
+
+  const applyModelDefaults = (modelId) => {
+    if (modelId === 'luxtts') {
+      setTemperature(0.5);
+      setSpeed(1.0);
+    } else if (modelId === 's2pro') {
+      setTemperature(0.8);
+      setTopP(0.8);
+      setTopK(30);
+      setMaxTokens(1024);
+      setGpuLayers(-1);
+      setCodecCpu(false);
+      setS2Backend('auto');
+    } else {
+      setTemperature(0.0);
+    }
   };
 
   const fetchModelInstalledStatus = async () => {
@@ -227,12 +253,7 @@ export default function VoiceCloneWindow() {
           if (data.model_loaded && data.model_type) {
             setSelectedModel(prev => {
               if (prev !== data.model_type) {
-                if (data.model_type === 'luxtts') {
-                  setTemperature(0.5);
-                  setSpeed(1.0);
-                } else {
-                  setTemperature(0.0);
-                }
+                applyModelDefaults(data.model_type);
               }
               return data.model_type;
             });
@@ -382,13 +403,7 @@ export default function VoiceCloneWindow() {
   const handleModelChange = async (e) => {
     const val = e.target.value;
     setSelectedModel(val);
-    
-    if (val === 'luxtts') {
-      setTemperature(0.5);
-      setSpeed(1.0);
-    } else {
-      setTemperature(0.0);
-    }
+    applyModelDefaults(val);
     
     if (modelLoaded) {
       setLoadingModel(true);
@@ -777,6 +792,15 @@ export default function VoiceCloneWindow() {
         }
         if (selectedModel === 'luxtts' && speed !== undefined && speed !== null) {
           bodyPayload.speed = speed;
+        }
+        if (selectedModel === 's2pro') {
+          bodyPayload.model_name = 's2pro';
+          bodyPayload.top_p = topP;
+          bodyPayload.top_k = topK;
+          bodyPayload.max_tokens = maxTokens;
+          bodyPayload.gpu_layers = gpuLayers;
+          bodyPayload.codec_cpu = codecCpu;
+          bodyPayload.s2_backend = s2Backend;
         }
 
         const response = await fetch('http://127.0.0.1:5555/clone', {
@@ -1167,7 +1191,8 @@ export default function VoiceCloneWindow() {
                   <option value="luxtts">LuxTTS 1.7B Distilled (~1 GB VRAM)</option>
                   <option value="qwen3tts_0.6b">Qwen3-TTS 0.6B Base (~3 GB VRAM)</option>
                   <option value="qwen3tts_1.7b">Qwen3-TTS 1.7B Base (~6 GB VRAM)</option>
-                  {(modelsList.length > 0 ? modelsList.filter(m => m.id !== 'luxtts' && m.id !== 'qwen3tts_0.6b' && m.id !== 'qwen3tts_1.7b') : []).map(m => (
+                  <option value="s2pro">S2 Pro 5B Q4_K_M (3.6 GB file · ~7 GB VRAM full offload)</option>
+                  {(modelsList.length > 0 ? modelsList.filter(m => m.id !== 'luxtts' && m.id !== 'qwen3tts_0.6b' && m.id !== 'qwen3tts_1.7b' && m.id !== 's2pro') : []).map(m => (
                     <option key={m.id} value={m.id}>{m.name}</option>
                   ))}
                 </select>
@@ -1540,6 +1565,143 @@ export default function VoiceCloneWindow() {
                   disabled={generating}
                 />
               </div>
+            )}
+
+            {/* S2 Pro engine parameters (s2.cpp CLI) */}
+            {selectedModel === 's2pro' && (
+              <>
+                <div className="form-row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ color: '#a0a0b0', minWidth: 80 }}>Top-P:</span>
+                  <input
+                    type="range"
+                    min="0.0"
+                    max="1.0"
+                    step="0.05"
+                    value={topP}
+                    onChange={(e) => setTopP(parseFloat(e.target.value) || 0.8)}
+                    style={{ flex: 1, accentColor: 'var(--accent-primary, #7c4dff)', cursor: 'pointer' }}
+                    disabled={generating}
+                  />
+                  <input
+                    type="number"
+                    className="form-control input-number"
+                    min="0.0"
+                    max="1.0"
+                    step="0.05"
+                    value={topP}
+                    onChange={(e) => {
+                      let val = parseFloat(e.target.value);
+                      if (isNaN(val)) return;
+                      val = Math.max(0.0, Math.min(1.0, val));
+                      setTopP(val);
+                    }}
+                    style={{ width: '60px', padding: '4px 6px', textAlign: 'center' }}
+                    disabled={generating}
+                  />
+                </div>
+
+                <div className="form-row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ color: '#a0a0b0', minWidth: 80 }}>Top-K:</span>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    step="1"
+                    value={topK}
+                    onChange={(e) => setTopK(parseInt(e.target.value, 10) || 30)}
+                    style={{ flex: 1, accentColor: 'var(--accent-primary, #7c4dff)', cursor: 'pointer' }}
+                    disabled={generating}
+                  />
+                  <input
+                    type="number"
+                    className="form-control input-number"
+                    min="1"
+                    max="100"
+                    step="1"
+                    value={topK}
+                    onChange={(e) => {
+                      let val = parseInt(e.target.value, 10);
+                      if (isNaN(val)) return;
+                      val = Math.max(1, Math.min(100, val));
+                      setTopK(val);
+                    }}
+                    style={{ width: '60px', padding: '4px 6px', textAlign: 'center' }}
+                    disabled={generating}
+                  />
+                </div>
+
+                <div className="form-row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ color: '#a0a0b0', minWidth: 80 }}>Max Tokens:</span>
+                  <input
+                    type="number"
+                    className="form-control input-number"
+                    min="64"
+                    max="2048"
+                    step="64"
+                    value={maxTokens}
+                    onChange={(e) => {
+                      let val = parseInt(e.target.value, 10);
+                      if (isNaN(val)) return;
+                      val = Math.max(64, Math.min(2048, val));
+                      setMaxTokens(val);
+                    }}
+                    style={{ width: '110px', padding: '4px 6px', textAlign: 'center' }}
+                    disabled={generating}
+                  />
+                </div>
+
+                <div className="form-row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ color: '#a0a0b0', minWidth: 80 }}>GPU Layers:</span>
+                  <input
+                    type="number"
+                    className="form-control input-number"
+                    min="-1"
+                    max="36"
+                    step="1"
+                    value={gpuLayers}
+                    onChange={(e) => {
+                      let val = parseInt(e.target.value, 10);
+                      if (isNaN(val)) return;
+                      val = Math.max(-1, Math.min(36, val));
+                      setGpuLayers(val);
+                    }}
+                    style={{ width: '110px', padding: '4px 6px', textAlign: 'center' }}
+                    disabled={generating}
+                  />
+                  <span style={{ fontSize: '11px', color: '#a0a0b0' }}>(-1 = auto, 0 = CPU)</span>
+                </div>
+
+                <div className="form-row" style={{ justifyContent: 'space-between' }}>
+                  <span style={{ color: '#a0a0b0', minWidth: 80 }}>Backend:</span>
+                  <select
+                    className="form-control"
+                    value={s2Backend}
+                    onChange={(e) => setS2Backend(e.target.value)}
+                    disabled={generating}
+                    style={{ width: '150px', flex: 'none' }}
+                  >
+                    <option value="auto">Auto (CUDA if present)</option>
+                    <option value="cuda">CUDA (NVIDIA)</option>
+                    <option value="vulkan">Vulkan (AMD/Intel)</option>
+                    <option value="cpu">CPU only</option>
+                  </select>
+                </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '12px', color: codecCpu ? '#ffd740' : '#a0a0b0', cursor: 'pointer', userSelect: 'none' }}>
+                  <input
+                    type="checkbox"
+                    checked={codecCpu}
+                    onChange={e => setCodecCpu(e.target.checked)}
+                    style={{ accentColor: '#ffd740' }}
+                    disabled={generating}
+                  />
+                  Keep audio codec on CPU (saves VRAM)
+                </label>
+
+                <div style={{ fontSize: '10px', color: '#808090', lineHeight: 1.5, padding: '6px 8px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                  <strong style={{ color: '#ffd740' }}>VRAM guide (Q4_K_M):</strong> full offload ≈ 7.2 GB · 6-7 GB VRAM → GPU Layers 18 + Codec CPU · &lt;6 GB → GPU Layers ≤10 + Codec CPU. Engine: s2.cpp (github.com/rodrigomatta/s2.cpp) — place s2.exe in models/s2pro/ or s2.cpp/build/. Research/non-commercial license (Fish Audio).
+                </div>
+              </>
             )}
           </div>
 

@@ -10,5 +10,7 @@ node/
 scratch/
 models/
 userData/
+__pycache__/
+presets/media/voice_cache/
 
 VIBE-BR-Video Editor/

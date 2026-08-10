@@ -3,6 +3,7 @@ import sys
 import uuid
 import time
 import gc
+import subprocess
 
 # Configure project-local Hugging Face home directory before loading anything else
 project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,7 +51,7 @@ def status():
     return jsonify({
         "status": "active",
         "cuda_available": cuda_avail,
-        "model_loaded": model is not None,
+        "model_loaded": model is not None or model_type == "s2pro",
         "model_type": model_type,
         "gpu_name": torch.cuda.get_device_name(0) if cuda_avail else "CPU",
         "vram_total": torch.cuda.get_device_properties(0).total_memory / (1024**3) if cuda_avail else 0
@@ -125,6 +126,20 @@ def check_model_installed(model_name):
             if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
                 return False
         return True
+    elif model_name == "s2pro":
+        local_path = os.path.join(project_dir, "models", "s2pro")
+        if not os.path.exists(local_path):
+            return False
+        model_file = os.path.join(local_path, S2_PRO_MODEL_FILE)
+        tokenizer_file = os.path.join(local_path, S2_PRO_TOKENIZER_FILE)
+        if not os.path.exists(model_file) or not os.path.exists(tokenizer_file):
+            return False
+        # Partial-download guard: the GGUF must be near its full ~3.3 GB size
+        if os.path.getsize(model_file) < 3 * 1024**3:
+            return False
+        if os.path.getsize(tokenizer_file) < 1024**2:
+            return False
+        return True
     return False
 
 # ─── Auto-detection of installed models ─────────────────────
@@ -154,7 +169,31 @@ MODEL_INFO = {
         "repo_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         "local_dir": "qwen3tts_1.7b",
     },
+    "s2pro": {
+        "name": "S2 Pro 5B (GGUF Q4_K_M)",
+        "type": "s2pro",
+        "repo_id": "rodrigomt/s2-pro-gguf",
+        "local_dir": "s2pro",
+    },
 }
+
+def find_s2_binary():
+    """Locate the s2.cpp engine executable (built from https://github.com/rodrigomatta/s2.cpp)."""
+    candidates = [
+        os.path.join(project_dir, "models", "s2pro", "s2.exe"),
+        os.path.join(project_dir, "s2.cpp", "build", "s2.exe"),
+        os.path.join(project_dir, "s2.cpp", "build", "Release", "s2.exe"),
+        os.path.join(project_dir, "s2.cpp", "build", "bin", "s2.exe"),
+        os.path.join(project_dir, "s2.cpp", "build", "Debug", "s2.exe"),
+        os.path.join(project_dir, "s2.cpp", "s2.exe"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("s2")
+
+S2_PRO_MODEL_FILE = "s2-pro-q4_k_m.gguf"
+S2_PRO_TOKENIZER_FILE = "tokenizer.json"
 
 def _dir_size(path):
     total = 0
@@ -283,6 +322,10 @@ def download_model_thread(model_name):
                 "tokenizer_config.json",
                 "vocab.json"
             ]
+        elif model_name == "s2pro":
+            repo_id = "rodrigomt/s2-pro-gguf"
+            dest_dir = os.path.join(project_dir, "models", "s2pro")
+            files_to_download = [S2_PRO_MODEL_FILE, S2_PRO_TOKENIZER_FILE]
         else:
             raise ValueError(f"Unknown model: {model_name}")
 
@@ -419,6 +462,8 @@ def uninstall_model():
             dest_dir = os.path.join(project_dir, "models", "qwen3tts")
         elif model_name == "qwen3tts_1.7b":
             dest_dir = os.path.join(project_dir, "models", "qwen3tts_1.7b")
+        elif model_name == "s2pro":
+            dest_dir = os.path.join(project_dir, "models", "s2pro")
         else:
             return jsonify({"success": False, "error": f"Unknown model name: {model_name}"}), 400
             
@@ -476,6 +521,19 @@ def load_model():
             )
             model_type = requested_type
             print(f"[Python Server] Qwen3-TTS {requested_type} model loaded successfully.", flush=True)
+        elif requested_type == "s2pro":
+            # S2 Pro runs through the s2.cpp engine (per-invocation CLI); no
+            # persistent model is kept in memory. "Load" validates the engine.
+            local_path = os.path.join(project_dir, "models", "s2pro")
+            model_file = os.path.join(local_path, S2_PRO_MODEL_FILE)
+            tokenizer_file = os.path.join(local_path, S2_PRO_TOKENIZER_FILE)
+            if not (os.path.exists(model_file) and os.path.exists(tokenizer_file)):
+                return jsonify({"success": False, "error": "S2 Pro model files are missing. Download the model first."}), 400
+            s2_binary = find_s2_binary()
+            if not s2_binary:
+                return jsonify({"success": False, "error": "S2 Pro engine (s2.exe) not found. Build s2.cpp (github.com/rodrigomatta/s2.cpp) and place s2.exe in models/s2pro/ or s2.cpp/build/."}), 400
+            model_type = "s2pro"
+            print(f"[Python Server] S2 Pro engine ready ({s2_binary}). Model invoked per request via s2.cpp CLI.", flush=True)
         else: # default: luxtts
             lux_device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[Python Server] Loading LuxTTS model on {lux_device}...", flush=True)
@@ -522,8 +580,13 @@ def unload_model():
 def clone_voice():
     global model, model_type
     
-    # Auto-load if not loaded
-    if model is None:
+    data = request.json or {}
+    requested_model = data.get("model_name")
+    if requested_model == "s2pro":
+        model_type = "s2pro"
+    
+    # Auto-load if not loaded (torch models only; s2pro is stateless per-invocation)
+    if model is None and model_type != "s2pro":
         try:
             import torch
             lux_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -615,6 +678,75 @@ def clone_voice():
             if hasattr(audio_data, "cpu"):
                 audio_data = audio_data.cpu().numpy()
             audio_data = np.squeeze(audio_data)
+        elif model_type == "s2pro":
+            # S2 Pro via the s2.cpp engine: per-request CLI invocation.
+            s2_binary = find_s2_binary()
+            if not s2_binary:
+                return jsonify({"success": False, "error": "S2 Pro engine (s2.exe) not found. Build s2.cpp (github.com/rodrigomatta/s2.cpp) and place s2.exe in models/s2pro/ or s2.cpp/build/."}), 500
+            local_path = os.path.join(project_dir, "models", "s2pro")
+            model_file = os.path.join(local_path, S2_PRO_MODEL_FILE)
+            tokenizer_file = os.path.join(local_path, S2_PRO_TOKENIZER_FILE)
+            if not (os.path.exists(model_file) and os.path.exists(tokenizer_file)):
+                return jsonify({"success": False, "error": "S2 Pro model files are missing. Download the model first."}), 500
+            
+            file_id = str(uuid.uuid4())
+            out_wav = os.path.join(temp_dir, f"s2_{file_id}.wav")
+            
+            cmd = [
+                s2_binary,
+                "--model", model_file,
+                "--tokenizer", tokenizer_file,
+                "--prompt-audio", ref_audio,
+                "--text", text,
+                "--output", out_wav,
+            ]
+            if ref_text and ref_text.strip():
+                cmd += ["--prompt-text", ref_text]
+            
+            # Backend: explicit user choice, else CUDA when available, else CPU.
+            s2_backend = data.get("s2_backend", "auto")
+            if s2_backend == "cuda":
+                cmd += ["--cuda", "0"]
+            elif s2_backend == "vulkan":
+                cmd += ["--vulkan", "0"]
+            elif s2_backend != "cpu" and torch.cuda.is_available():
+                cmd += ["--cuda", "0"]
+            
+            if temperature is not None:
+                cmd += ["--temperature", str(float(temperature))]
+            if data.get("top_p") is not None:
+                cmd += ["--top-p", str(float(data["top_p"]))]
+            if data.get("top_k") is not None:
+                cmd += ["--top-k", str(int(data["top_k"]))]
+            if data.get("max_tokens") is not None:
+                cmd += ["--max-tokens", str(int(data["max_tokens"]))]
+            gpu_layers = data.get("gpu_layers")
+            if gpu_layers is not None and float(gpu_layers) >= 0:
+                cmd += ["--gpu-layers", str(int(float(gpu_layers)))]
+            if data.get("codec_cpu"):
+                cmd += ["--codec-cpu"]
+            
+            print(f"[Python Server] Running s2.cpp: {' '.join(cmd)}", flush=True)
+            proc_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+                creationflags=proc_flags,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                tail = detail.splitlines()[-3:] if detail else []
+                return jsonify({"success": False, "error": f"s2.cpp failed (exit {proc.returncode}): {' | '.join(tail)}"}), 500
+            
+            audio_data, sr = sf.read(out_wav)
+            try:
+                os.remove(out_wav)
+            except OSError:
+                pass
         else: # luxtts
             # Encode reference prompt
             encoded_prompt = model.encode_prompt(ref_audio, prompt_text=ref_text)

@@ -23,6 +23,7 @@ Timeline placement is driven by **filenames**, so an image folder + script fully
 - The image appears when the **start phrase** begins being spoken.
 - The image disappears when the **end phrase** finishes being spoken.
 - No `___` separator → the whole filename is the covered span.
+- **Numbered prefixes take priority**: filenames like `1_<start phrase> ___ <end phrase>.jpg` are applied strictly in numeric-prefix order, guaranteeing the timeline order, while their duration still follows the phrase span. Images without a number prefix fall back to phrase-based placement.
 - Fuzzy matching tolerates typos, number words (`one` = `1`), and small word skips.
 - Timing comes from TTS word timings when available, otherwise proportional estimates.
 

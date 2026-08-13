@@ -23,8 +23,10 @@ export function alignWords(scriptWords, whisperWords) {
 
   for (let i = 1; i <= n; i++) {
     for (let j = 1; j <= m; j++) {
-      const w1 = scriptWords[i - 1].toLowerCase().replace(/[^\w]/g, '');
-      const w2 = String(whisperWords[j - 1].text ?? whisperWords[j - 1].word ?? '').toLowerCase().replace(/[^\w]/g, '');
+      const sWord = scriptWords[i - 1];
+      const wWord = whisperWords[j - 1];
+      const w1 = String(sWord || '').toLowerCase().replace(/[^\w]/g, '');
+      const w2 = String(wWord ? (wWord.text ?? wWord.word ?? '') : '').toLowerCase().replace(/[^\w]/g, '');
       
       const matchCost = (w1 === w2) ? 0 : 1;
 
@@ -55,10 +57,11 @@ export function alignWords(scriptWords, whisperWords) {
 
   while (i > 0 || j > 0) {
     if (i > 0 && j > 0 && parent[i][j] === 0) {
+      const wObj = whisperWords[j - 1];
       aligned.push({
         text: scriptWords[i - 1],
-        start: whisperWords[j - 1].start,
-        end: whisperWords[j - 1].end,
+        start: wObj && typeof wObj.start === 'number' ? wObj.start : -1,
+        end: wObj && typeof wObj.end === 'number' ? wObj.end : -1,
       });
       i--;
       j--;
@@ -78,10 +81,10 @@ export function alignWords(scriptWords, whisperWords) {
 
   // Interpolate missing timestamps
   for (let k = 0; k < aligned.length; k++) {
-    if (aligned[k].start === -1) {
+    if (aligned[k].start === -1 || aligned[k].end === -1) {
       let prevEnd = 0;
       for (let prev = k - 1; prev >= 0; prev--) {
-        if (aligned[prev].end !== -1) {
+        if (aligned[prev].end !== -1 && aligned[prev].end !== undefined) {
           prevEnd = aligned[prev].end;
           break;
         }
@@ -89,7 +92,7 @@ export function alignWords(scriptWords, whisperWords) {
 
       let nextStart = 0;
       for (let next = k + 1; next < aligned.length; next++) {
-        if (aligned[next].start !== -1) {
+        if (aligned[next].start !== -1 && aligned[next].start !== undefined) {
           nextStart = aligned[next].start;
           break;
         }
@@ -108,14 +111,104 @@ export function alignWords(scriptWords, whisperWords) {
   return aligned;
 }
 
+/**
+ * Slices the word timestamps of a single continuous narration (merged
+ * voiceover, one audio file for the whole script) and distributes them
+ * across the dialogue blocks.
+ *
+ * The script words of every block are aligned against the merged narration
+ * words in one pass; each block then gets its exact spoken window
+ * (startTime/duration) plus its own words with timestamps relative to the
+ * block start. Caption text is always taken from the SCRIPT words, never
+ * from the transcription, so it stays byte-for-byte equal to the script
+ * while being in sync with the voiceover.
+ *
+ * @param {Array} blocks Dialogue blocks (must stay in script order)
+ * @param {Array} mergedWords Whisper-style [{text,start,end}] for the whole narration
+ * @param {number} [anchorTime] Timeline time where the narration audio starts
+ * @returns {Array} New blocks with sliced startTime/duration/words
+ */
+export function distributeMergedWords(blocks, mergedWords, anchorTime = null) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return blocks;
+
+  const corpus = [];
+  blocks.forEach((block, blockIdx) => {
+    if (block.scriptMatched === false) return;
+    const scriptWords = (block.text || '').split(/\s+/).filter(w => w.length > 0);
+    scriptWords.forEach((word, wordIdx) => {
+      corpus.push({ blockIdx, wordIdx, word });
+    });
+  });
+
+  if (corpus.length === 0 || !Array.isArray(mergedWords) || mergedWords.length === 0) {
+    return blocks;
+  }
+
+  const aligned = alignWords(corpus.map(e => e.word), mergedWords);
+  if (!aligned || aligned.length !== corpus.length) return blocks;
+
+  const base = anchorTime != null ? anchorTime : (blocks[0].startTime || 0);
+
+  const perBlock = blocks.map(() => ({
+    firstStart: Infinity,
+    lastEnd: -Infinity,
+    words: [],
+  }));
+
+  aligned.forEach((a, k) => {
+    const { blockIdx } = corpus[k];
+    const s = typeof a.start === 'number' && a.start >= 0 ? a.start : 0;
+    const e = typeof a.end === 'number' && a.end >= s ? a.end : s + 0.3;
+    const acc = perBlock[blockIdx];
+    if (s < acc.firstStart) acc.firstStart = s;
+    if (e > acc.lastEnd) acc.lastEnd = e;
+    acc.words.push({ text: a.text, start: s, end: e });
+  });
+
+  const trailingPad = 0.4;
+  let prevEnd = -Infinity;
+  return blocks.map((block, blockIdx) => {
+    if (block.scriptMatched === false) {
+      return { ...block, words: [], duration: Math.max(0.5, block.duration || 0.5) };
+    }
+    const acc = perBlock[blockIdx];
+    if (acc.words.length === 0) {
+      return { ...block, words: [], duration: Math.max(0.5, block.duration || 0.5) };
+    }
+    const sliceStart = Math.max(0, acc.firstStart);
+    const duration = Math.max(0.4, acc.lastEnd - sliceStart + trailingPad);
+    const startTime = Math.max(base + sliceStart, prevEnd);
+    prevEnd = startTime + duration;
+    return {
+      ...block,
+      startTime,
+      duration,
+      words: acc.words.map(w => ({
+        ...w,
+        start: Math.max(0, w.start - sliceStart),
+        end: Math.max(0.05, w.end - sliceStart),
+      })),
+    };
+  });
+}
+
 export function getCaptionActiveWordInfo(text, startTime, duration, currentTime, wordsPerLine = 3, blockWords = null) {
   const elapsed = currentTime - startTime;
   
-  const scriptWords = text.split(/\s+/).filter(w => w.length > 0);
+  const scriptWords = (text || '').split(/\s+/).filter(w => w.length > 0);
   if (scriptWords.length === 0) return { text: '', activeWordIndex: -1 };
 
   if (blockWords && blockWords.length > 0) {
     const alignedWords = alignWords(scriptWords, blockWords);
+
+    // Leading silence: hold the caption until the first word is actually
+    // spoken so it stays in sync with the voiceover instead of popping in
+    // at the block start.
+    const firstAligned = alignedWords[0];
+    if (firstAligned && typeof firstAligned.start === 'number' && firstAligned.start > 0 && elapsed < firstAligned.start) {
+      return { text: '', activeWordIndex: -1 };
+    }
+
     let activeWordIndex = -1;
     
     // Find active word based on timing relative to block start
@@ -167,7 +260,8 @@ export function getCaptionActiveWordInfo(text, startTime, duration, currentTime,
     }
     
     const numChunks = chunks.length;
-    const chunkDuration = duration / numChunks;
+    const safeDuration = Math.max(0.1, duration || 0);
+    const chunkDuration = safeDuration / Math.max(1, numChunks);
     const chunkIndex = Math.floor(elapsed / chunkDuration);
     const activeChunkIndex = Math.max(0, Math.min(numChunks - 1, chunkIndex));
     const activeChunk = chunks[activeChunkIndex] || [];

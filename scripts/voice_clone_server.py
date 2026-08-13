@@ -3,6 +3,7 @@ import sys
 import uuid
 import time
 import gc
+import glob
 import subprocess
 
 # Configure project-local Hugging Face home directory before loading anything else
@@ -33,6 +34,43 @@ os.makedirs(cache_dir, exist_ok=True)
 import hashlib
 import json
 
+# ─── Fast startup helpers ────────────────────────────────────
+# torch import + CUDA detection take seconds, and scan_installed_models()
+# walks the local model cache (slow once models are downloaded). Both are
+# moved to a background thread so Flask binds immediately and /status
+# never blocks on them.
+
+_gpu_info = {
+    "ready": False,
+    "cuda_available": False,
+    "gpu_name": "CPU",
+    "vram_total": 0,
+}
+
+def _warmup_background():
+    try:
+        import torch
+        _gpu_info["cuda_available"] = bool(torch.cuda.is_available())
+        if _gpu_info["cuda_available"]:
+            _gpu_info["gpu_name"] = torch.cuda.get_device_name(0)
+            _gpu_info["vram_total"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    except Exception as e:
+        print(f"[Python Server] Torch warmup failed: {str(e)}", flush=True)
+    finally:
+        _gpu_info["ready"] = True
+    try:
+        scan = scan_installed_models()
+        print(f"[Python Server] Auto-detected models: {json.dumps(scan, indent=2)}", flush=True)
+        # Warm the s2 GPU-backend probe in the background so the first
+        # generation never blocks for up to ~6 minutes.
+        if scan.get("s2pro", {}).get("installed"):
+            binary = find_s2_binary()
+            if binary:
+                print("[Python Server] Probing s2 GPU backends in background...", flush=True)
+                probe_s2_backends(binary)
+    except Exception as e:
+        print(f"[Python Server] Model scan failed: {str(e)}", flush=True)
+
 def get_cache_key(text, ref_audio, ref_text, temperature, speed, model_type):
     ref_audio_stat = ""
     if os.path.exists(ref_audio):
@@ -46,15 +84,17 @@ def get_cache_key(text, ref_audio, ref_text, temperature, speed, model_type):
 
 @app.route("/status", methods=["GET"])
 def status():
-    import torch
-    cuda_avail = torch.cuda.is_available()
+    with gen_lock:
+        generating = gen_busy > 0
     return jsonify({
         "status": "active",
-        "cuda_available": cuda_avail,
+        "cuda_available": _gpu_info["cuda_available"],
         "model_loaded": model is not None or model_type == "s2pro",
         "model_type": model_type,
-        "gpu_name": torch.cuda.get_device_name(0) if cuda_avail else "CPU",
-        "vram_total": torch.cuda.get_device_properties(0).total_memory / (1024**3) if cuda_avail else 0
+        "gpu_name": _gpu_info["gpu_name"],
+        "vram_total": _gpu_info["vram_total"],
+        "generating": generating,
+        "s2_capabilities": _s2_backend_probe_cache,
     })
 
 import threading
@@ -72,6 +112,47 @@ download_state = {
     "downloaded_bytes": 0,
     "error": None
 }
+
+# ─── Generation cancellation / reset state ─────────────────────
+# Cancel works with a token: /cancel bumps the token; every /clone
+# request snapshots the token at entry and compares it at its
+# checkpoints. A bumped token only affects requests that were already
+# in flight — requests that START after the cancel are unaffected, so a
+# fresh run never inherits a stale cancel.
+gen_lock = threading.Lock()
+cancel_token = 0
+gen_busy = 0
+current_s2_proc = None
+
+def snapshot_cancel_token():
+    with gen_lock:
+        return cancel_token
+
+def bump_cancel():
+    """Request cancellation of any in-flight generation."""
+    global cancel_token
+    with gen_lock:
+        cancel_token += 1
+    proc = current_s2_proc
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def check_cancel(token):
+    with gen_lock:
+        return cancel_token != token
+
+def inc_busy():
+    global gen_busy
+    with gen_lock:
+        gen_busy += 1
+
+def dec_busy():
+    global gen_busy
+    with gen_lock:
+        gen_busy = max(0, gen_busy - 1)
 
 def check_model_installed(model_name):
     if model_name == "luxtts":
@@ -191,6 +272,96 @@ def find_s2_binary():
         if os.path.isfile(c):
             return c
     return shutil.which("s2")
+
+def s2_subprocess_env():
+    """Env for spawning the s2 engine: prepend MinGW runtime dirs so the
+    MinGW-built binary finds libgcc_s_seh-1.dll / libstdc++-6.dll etc., plus
+    the project-local CUDA toolkit bin so the CUDA build finds cudart64_12.dll
+    and cublas64_12.dll at runtime."""
+    env = dict(os.environ)
+    extra = []
+    for cand in (
+        os.path.join(project_dir, "tools", "mingw64", "bin"),
+        os.path.join(project_dir, "mingw64", "bin"),
+        os.path.join(project_dir, "tools", "cuda", "bin"),
+        os.path.join(project_dir, "s2.cpp", "build"),
+    ):
+        if os.path.isdir(cand):
+            extra.append(cand)
+    s2_bin = find_s2_binary()
+    if s2_bin:
+        d = os.path.dirname(s2_bin)
+        if d not in extra and os.path.isdir(d):
+            extra.append(d)
+    if extra:
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
+
+_s2_backend_probe_cache = None
+
+def probe_s2_backends(binary):
+    """Determine which GPU backends the built s2 engine actually supports.
+
+    Builds compiled without e.g. GGML_USE_CUDA still list --cuda/--vulkan in
+    --help, but abort model init immediately ("backend is unavailable...")
+    when those flags are used. Probe each backend with a 1-token generation;
+    unsupported backends fail in ~1-2 s, supported ones succeed.
+    """
+    global _s2_backend_probe_cache
+    if _s2_backend_probe_cache is not None:
+        return _s2_backend_probe_cache
+
+    model_file = os.path.join(project_dir, "models", "s2pro", S2_PRO_MODEL_FILE)
+    tokenizer_file = os.path.join(project_dir, "models", "s2pro", S2_PRO_TOKENIZER_FILE)
+    ref_files = glob.glob(os.path.join(project_dir, "assets", "default_voices", "*.wav"))
+    ref_audio = ref_files[0] if ref_files else ""
+    ref_text = ""
+    if ref_audio:
+        tx = ref_audio + ".txt"
+        if os.path.isfile(tx):
+            try:
+                ref_text = open(tx, "r", encoding="utf-8").read().strip()
+            except OSError:
+                ref_text = ""
+
+    caps = {"cuda": False, "vulkan": False}
+    if not (os.path.isfile(model_file) and os.path.isfile(tokenizer_file) and ref_audio):
+        _s2_backend_probe_cache = caps
+        return caps
+
+    proc_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    for name, flag in (("cuda", "--cuda"), ("vulkan", "--vulkan")):
+        out_path = os.path.join(temp_dir, f"_s2probe_{name}.wav")
+        cmd = [
+            binary, "--model", model_file, "--tokenizer", tokenizer_file,
+            "--prompt-audio", ref_audio, "--text", "x", "--output", out_path,
+            "--max-tokens", "1", "--log-level", "error",
+            flag, "0", "--gpu-layers", "1",
+        ]
+        if ref_text:
+            cmd += ["--prompt-text", ref_text]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=180, creationflags=proc_flags,
+                env=s2_subprocess_env(),
+            )
+            detail = (proc.stderr or proc.stdout or "")
+            caps[name] = (proc.returncode == 0) and os.path.isfile(out_path)
+            if caps[name]:
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+        except Exception:
+            caps[name] = False
+        if not caps[name] and name == "cuda":
+            # On machines without a CUDA build, Vulkan is the only other GPU option
+            continue
+
+    print(f"[Python Server] s2 backend probe: {caps}", flush=True)
+    _s2_backend_probe_cache = caps
+    return caps
 
 S2_PRO_MODEL_FILE = "s2-pro-q4_k_m.gguf"
 S2_PRO_TOKENIZER_FILE = "tokenizer.json"
@@ -485,45 +656,12 @@ def load_model():
         import torch
         data = request.json or {}
         requested_type = data.get("model_name", "luxtts")
-        
-        if model is not None and model_type == requested_type:
-            return jsonify({"success": True, "message": f"Model {requested_type} already loaded"})
-            
-        if model is not None:
-            print(f"[Python Server] Unloading existing {model_type} model to switch...", flush=True)
-            del model
-            model = None
-            model_type = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        
-        if requested_type in ["qwen3tts_0.6b", "qwen3tts_1.7b"]:
-            print(f"[Python Server] Loading Qwen3-TTS {requested_type} model on {device}...", flush=True)
-            from qwen_tts import Qwen3TTSModel
-            dtype = torch.float32
-            
-            local_path = os.path.join(project_dir, "models", "qwen3tts" if requested_type == "qwen3tts_0.6b" else "qwen3tts_1.7b")
-            if os.path.exists(os.path.join(local_path, "model.safetensors")):
-                model_id_or_path = local_path
-                print(f"[Python Server] Loading Qwen3-TTS from local folder: {local_path}", flush=True)
-            else:
-                model_id_or_path = "Qwen/Qwen3-TTS-12Hz-0.6B-Base" if requested_type == "qwen3tts_0.6b" else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-                print(f"[Python Server] Loading Qwen3-TTS from Hugging Face Hub: {model_id_or_path}", flush=True)
-                
-            model = Qwen3TTSModel.from_pretrained(
-                model_id_or_path,
-                device_map=device,
-                dtype=dtype,
-                attn_implementation="eager"
-            )
-            model_type = requested_type
-            print(f"[Python Server] Qwen3-TTS {requested_type} model loaded successfully.", flush=True)
-        elif requested_type == "s2pro":
-            # S2 Pro runs through the s2.cpp engine (per-invocation CLI); no
-            # persistent model is kept in memory. "Load" validates the engine.
+
+        # S2 Pro runs through the s2.cpp engine (per-invocation CLI); no
+        # persistent model is kept in memory. Loading it merely validates the
+        # engine and must NEVER unload the in-memory torch model that may
+        # already be resident (the frontend falls back to it if S2 Pro fails).
+        if requested_type == "s2pro":
             local_path = os.path.join(project_dir, "models", "s2pro")
             model_file = os.path.join(local_path, S2_PRO_MODEL_FILE)
             tokenizer_file = os.path.join(local_path, S2_PRO_TOKENIZER_FILE)
@@ -534,22 +672,69 @@ def load_model():
                 return jsonify({"success": False, "error": "S2 Pro engine (s2.exe) not found. Build s2.cpp (github.com/rodrigomatta/s2.cpp) and place s2.exe in models/s2pro/ or s2.cpp/build/."}), 400
             model_type = "s2pro"
             print(f"[Python Server] S2 Pro engine ready ({s2_binary}). Model invoked per request via s2.cpp CLI.", flush=True)
-        else: # default: luxtts
+            return jsonify({"success": True, "message": f"S2 Pro engine ready ({s2_binary})"})
+
+        if model is not None and model_type == requested_type:
+            return jsonify({"success": True, "message": f"Model {requested_type} already loaded"})
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+        # Build the new model object BEFORE dropping the current one so that a
+        # failed switch (missing files, import error, OOM, ...) never leaves
+        # the server without a model to generate with.
+        new_model = None
+        new_model_type = None
+
+        if requested_type in ["qwen3tts_0.6b", "qwen3tts_1.7b"]:
+            print(f"[Python Server] Loading Qwen3-TTS {requested_type} model on {device}...", flush=True)
+            from qwen_tts import Qwen3TTSModel
+            if torch.cuda.is_available():
+                dtype = torch.bfloat16 if (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()) else torch.float16
+            else:
+                dtype = torch.float32
+
+            local_path = os.path.join(project_dir, "models", "qwen3tts" if requested_type == "qwen3tts_0.6b" else "qwen3tts_1.7b")
+            if os.path.exists(os.path.join(local_path, "model.safetensors")):
+                model_id_or_path = local_path
+                print(f"[Python Server] Loading Qwen3-TTS from local folder: {local_path}", flush=True)
+            else:
+                model_id_or_path = "Qwen/Qwen3-TTS-12Hz-0.6B-Base" if requested_type == "qwen3tts_0.6b" else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+                print(f"[Python Server] Loading Qwen3-TTS from Hugging Face Hub: {model_id_or_path}", flush=True)
+
+            new_model = Qwen3TTSModel.from_pretrained(
+                model_id_or_path,
+                device_map=device,
+                dtype=dtype,
+                attn_implementation="eager"
+            )
+            new_model_type = requested_type
+        else: # luxtts
             lux_device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[Python Server] Loading LuxTTS model on {lux_device}...", flush=True)
             from zipvoice.luxvoice import LuxTTS
-            
+
             local_path = os.path.join(project_dir, "models", "luxtts")
             if os.path.exists(os.path.join(local_path, "model.pt")):
                 print(f"[Python Server] Loading LuxTTS from local folder: {local_path}", flush=True)
-                model = LuxTTS(model_path=local_path, device=lux_device)
+                new_model = LuxTTS(model_path=local_path, device=lux_device)
             else:
                 print("[Python Server] Loading LuxTTS from Hugging Face Hub snapshot...", flush=True)
-                model = LuxTTS(device=lux_device)
-                
-            model_type = "luxtts"
-            print("[Python Server] LuxTTS model loaded successfully.", flush=True)
-            
+                new_model = LuxTTS(device=lux_device)
+
+            new_model_type = "luxtts"
+
+        # Success — swap out the old model only now
+        if model is not None:
+            old_type = model_type
+            print(f"[Python Server] Unloading existing {old_type} model to switch...", flush=True)
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        model = new_model
+        model_type = new_model_type
+        print(f"[Python Server] Model {requested_type} loaded successfully.", flush=True)
         return jsonify({"success": True, "message": f"Model {requested_type} loaded successfully"})
     except Exception as e:
         traceback.print_exc()
@@ -576,31 +761,167 @@ def unload_model():
         print(f"[Python Server] Failed to unload model: {str(e)}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/cancel", methods=["POST"])
+def cancel_generation():
+    bump_cancel()
+    print("[Python Server] Cancel requested. In-flight generation will be aborted.", flush=True)
+    return jsonify({"success": True, "message": "Cancellation requested. Current generation will stop."})
+
+_graceful_shutdown = {"shutting_down": False}
+
+@app.route("/shutdown", methods=["POST"])
+def shutdown_server():
+    """Cancel any in-flight generation, unload the model from VRAM, then exit.
+
+    Called by the Electron main process when the voice-clone window or the
+    whole app closes, so a generation can never outlive the UI. The endpoint
+    replies immediately; the actual exit happens a moment later so the HTTP
+    response can flush first.
+    """
+    global model, model_type
+    if _graceful_shutdown["shutting_down"]:
+        return jsonify({"success": True, "message": "Shutdown already in progress"})
+    _graceful_shutdown["shutting_down"] = True
+
+    def _do_shutdown():
+        global model, model_type
+        try:
+            bump_cancel()
+            proc = current_s2_proc
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            # Let the in-flight /clone request observe the bump and bail out.
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                with gen_lock:
+                    busy = gen_busy > 0
+                if not busy:
+                    break
+                time.sleep(0.25)
+            try:
+                import torch
+                if model is not None:
+                    print(f"[Python Server] Shutdown: unloading {model_type} model from VRAM...", flush=True)
+                    del model
+                    model = None
+                model_type = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print("[Python Server] Shutdown: VRAM cleared.", flush=True)
+            except Exception as e:
+                print(f"[Python Server] Shutdown: model unload failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[Python Server] Shutdown error: {e}", flush=True)
+        finally:
+            # Let the HTTP response for /shutdown flush before exiting.
+            time.sleep(0.8)
+            print("[Python Server] Shutdown complete. Exiting.", flush=True)
+            os._exit(0)
+
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return jsonify({"success": True, "message": "Shutting down: generation cancelled, model unloaded."})
+
+@app.route("/reset", methods=["POST"])
+def reset_server():
+    global model, model_type, transcriber
+    try:
+        bump_cancel()
+        if model is not None:
+            print(f"[Python Server] Reset: unloading {model_type} model...", flush=True)
+            try:
+                del model
+            except Exception:
+                pass
+            model = None
+            model_type = None
+            transcriber = None
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        else:
+            transcriber = None
+            gc.collect()
+        print("[Python Server] Reset complete. Models unloaded, engine ready.", flush=True)
+        return jsonify({"success": True, "message": "Engine reset. All models unloaded."})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[Python Server] Reset failed: {str(e)}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/clone", methods=["POST"])
 def clone_voice():
     global model, model_type
     
     data = request.json or {}
-    requested_model = data.get("model_name")
-    if requested_model == "s2pro":
+    requested_model = data.get("model_name", "luxtts")
+
+    # Snapshot the cancel token for THIS request. If /cancel was pressed
+    # before this request started, abort immediately (prevents a cancelled
+    # run from quietly resuming on the next block).
+    gen_token = snapshot_cancel_token()
+    if check_cancel(gen_token):
+        print("[Python Server] Generation cancelled (pre-check).", flush=True)
+        return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+
+    # Auto-load if model is not loaded OR if loaded model doesn't match the
+    # requested torch model. S2 Pro needs no resident model, so it never
+    # triggers (or unhooks) an in-memory load.
+    # S2 Pro needs no resident torch model: just validate the engine and mark
+    # the active model type (also works when /load s2pro was never called).
+    if requested_model == "s2pro" and model_type != "s2pro":
+        s2_binary = find_s2_binary()
+        if not s2_binary:
+            return jsonify({"success": False, "error": "S2 Pro engine (s2.exe) not found. Build s2.cpp (github.com/rodrigomatta/s2.cpp) and place s2.exe in models/s2pro/ or s2.cpp/build/."}), 500
         model_type = "s2pro"
-    
-    # Auto-load if not loaded (torch models only; s2pro is stateless per-invocation)
-    if model is None and model_type != "s2pro":
+
+    # Auto-load if model is not loaded OR if loaded model doesn't match the
+    # requested torch model. S2 Pro needs no resident model, so it never
+    # triggers (or unhooks) an in-memory load.
+    if requested_model != "s2pro" and (model is None or (model_type != requested_model)):
         try:
             import torch
-            lux_device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[Python Server] Model not loaded. Auto-loading default LuxTTS model...", flush=True)
-            from zipvoice.luxvoice import LuxTTS
-            model = LuxTTS(device=lux_device)
-            model_type = "luxtts"
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            print(f"[Python Server] Model not loaded or mismatched. Auto-loading requested model '{requested_model}'...", flush=True)
+            if requested_model in ["qwen3tts_0.6b", "qwen3tts_1.7b"]:
+                from qwen_tts import Qwen3TTSModel
+                dtype = torch.bfloat16 if (torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()) else (torch.float16 if torch.cuda.is_available() else torch.float32)
+                local_path = os.path.join(project_dir, "models", "qwen3tts" if requested_model == "qwen3tts_0.6b" else "qwen3tts_1.7b")
+                model_id_or_path = local_path if os.path.exists(os.path.join(local_path, "model.safetensors")) else ("Qwen/Qwen3-TTS-12Hz-0.6B-Base" if requested_model == "qwen3tts_0.6b" else "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+                model = Qwen3TTSModel.from_pretrained(model_id_or_path, device_map=device, dtype=dtype, attn_implementation="eager")
+                model_type = requested_model
+            else:
+                from zipvoice.luxvoice import LuxTTS
+                lux_device = "cuda" if torch.cuda.is_available() else "cpu"
+                local_path = os.path.join(project_dir, "models", "luxtts")
+                if os.path.exists(os.path.join(local_path, "model.pt")):
+                    model = LuxTTS(model_path=local_path, device=lux_device)
+                else:
+                    model = LuxTTS(device=lux_device)
+                model_type = "luxtts"
         except Exception as load_err:
-            return jsonify({"success": False, "error": f"Model not loaded and auto-load failed: {str(load_err)}"}), 500
+            # If auto-loading the requested model fails but another model is
+            # already resident, keep that one instead of aborting the run.
+            if model is not None and model_type:
+                print(f"[Python Server] Auto-load of '{requested_model}' failed ({str(load_err)}). Falling back to loaded model '{model_type}'.", flush=True)
+            else:
+                return jsonify({"success": False, "error": f"Model not loaded and auto-load failed: {str(load_err)}"}), 500
             
     try:
+        inc_busy()
         import torch
         data = request.json or {}
         text = data.get("text", "")
+        device_used = "cuda:0" if torch.cuda.is_available() else "cpu"
+        resp_extra = {"device_used": device_used}
         language = data.get("language", "English")
         ref_audio = data.get("ref_audio", "")
         ref_text = data.get("ref_text", "")
@@ -702,16 +1023,37 @@ def clone_voice():
             ]
             if ref_text and ref_text.strip():
                 cmd += ["--prompt-text", ref_text]
-            
-            # Backend: explicit user choice, else CUDA when available, else CPU.
+            else:
+                return jsonify({"success": False, "error": "S2 Pro requires a reference transcript (ref_text). Use a default preset voice or provide one for the custom reference clip."}), 400
+
+            # Backend: explicit user choice, else auto-detect from what this
+            # particular s2 build actually supports (CUDA/Vulkan/CPU).
             s2_backend = data.get("s2_backend", "auto")
+            capabilities = probe_s2_backends(s2_binary)
+            backend_used = "cpu"
             if s2_backend == "cuda":
-                cmd += ["--cuda", "0"]
+                if not capabilities.get("cuda"):
+                    return jsonify({"success": False, "error": "This s2 engine build has no CUDA support (built CPU-only). Rebuild s2.cpp with -DS2_CUDA=ON and a CUDA Toolkit, or switch the S2 Backend to CPU."}), 400
+                backend_flag = ["--cuda", "0"]
+                backend_used = "cuda"
             elif s2_backend == "vulkan":
-                cmd += ["--vulkan", "0"]
-            elif s2_backend != "cpu" and torch.cuda.is_available():
-                cmd += ["--cuda", "0"]
-            
+                if not capabilities.get("vulkan"):
+                    return jsonify({"success": False, "error": "This s2 engine build has no Vulkan support. Rebuild s2.cpp with -DS2_VULKAN=ON, or switch the S2 Backend to CPU."}), 400
+                backend_flag = ["--vulkan", "0"]
+                backend_used = "vulkan"
+            else:  # auto
+                if capabilities.get("cuda"):
+                    backend_flag = ["--cuda", "0"]
+                    backend_used = "cuda"
+                elif capabilities.get("vulkan"):
+                    backend_flag = ["--vulkan", "0"]
+                    backend_used = "vulkan"
+                else:
+                    backend_flag = []  # CPU-only build
+                    print("[Python Server] WARNING: s2 engine built without GPU support (no CUDA/Vulkan). Falling back to CPU + system RAM. Rebuild s2.cpp with a GPU backend for acceleration.", flush=True)
+            cmd += backend_flag
+            resp_extra["s2_backend_used"] = backend_used
+
             if temperature is not None:
                 cmd += ["--temperature", str(float(temperature))]
             if data.get("top_p") is not None:
@@ -721,24 +1063,47 @@ def clone_voice():
             if data.get("max_tokens") is not None:
                 cmd += ["--max-tokens", str(int(data["max_tokens"]))]
             gpu_layers = data.get("gpu_layers")
-            if gpu_layers is not None and float(gpu_layers) >= 0:
+            if backend_flag and gpu_layers is not None and float(gpu_layers) >= 0:
                 cmd += ["--gpu-layers", str(int(float(gpu_layers)))]
             if data.get("codec_cpu"):
                 cmd += ["--codec-cpu"]
             
             print(f"[Python Server] Running s2.cpp: {' '.join(cmd)}", flush=True)
             proc_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=900,
                 creationflags=proc_flags,
+                env=s2_subprocess_env(),
             )
+            with gen_lock:
+                current_s2_proc = proc
+            try:
+                try:
+                    proc_out, proc_err = proc.communicate(timeout=900)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc_out, proc_err = proc.communicate()
+                    if check_cancel(gen_token):
+                        print("[Python Server] s2.cpp terminated by cancel.", flush=True)
+                        return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+                    return jsonify({"success": False, "error": "s2.cpp timed out after 900s"}), 500
+            finally:
+                with gen_lock:
+                    if current_s2_proc is proc:
+                        current_s2_proc = None
+            if check_cancel(gen_token):
+                print("[Python Server] s2.cpp finished but generation was cancelled.", flush=True)
+                return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
             if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()
+                detail = (proc_err or proc_out or "").strip()
                 tail = detail.splitlines()[-3:] if detail else []
                 return jsonify({"success": False, "error": f"s2.cpp failed (exit {proc.returncode}): {' | '.join(tail)}"}), 500
             
@@ -763,7 +1128,13 @@ def clone_voice():
             sr = 48000
             
         duration = len(audio_data) / sr
-        
+
+        # Cancel checkpoint: if the user pressed Cancel while this block was
+        # synthesizing, discard the result (nothing saved, nothing cached).
+        if check_cancel(gen_token):
+            print(f"[Python Server] Generation cancelled after synthesis ('{text[:30]}').", flush=True)
+            return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+
         # Write to file
         save_path = data.get("save_path", "")
         if save_path:
@@ -795,6 +1166,8 @@ def clone_voice():
             if active_transcriber is not None:
                 transcription_result = active_transcriber(wav_path, return_timestamps="word")
                 for chunk in transcription_result.get("chunks", []):
+                    if check_cancel(gen_token):
+                        break
                     ts = chunk.get("timestamp")
                     if ts is not None and ts[0] is not None and ts[1] is not None:
                         words.append({
@@ -806,6 +1179,10 @@ def clone_voice():
         except Exception as trans_err:
             traceback.print_exc()
             print(f"[Python Server] Failed to transcribe word timestamps: {str(trans_err)}", flush=True)
+
+        if check_cancel(gen_token):
+            print(f"[Python Server] Generation cancelled after transcription (discarding clip).", flush=True)
+            return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
 
         # Write to Cache
         try:
@@ -823,13 +1200,16 @@ def clone_voice():
             "success": True,
             "wav_path": wav_path,
             "duration": duration,
-            "words": words
+            "words": words,
+            **resp_extra
         })
         
     except Exception as e:
         traceback.print_exc()
         print(f"[Python Server] Voice clone failed: {str(e)}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        dec_busy()
 
 @app.route("/concatenate", methods=["POST"])
 def concatenate_voices():
@@ -854,6 +1234,10 @@ def concatenate_voices():
             audio_data, sr = sf.read(path)
             if target_sr is None:
                 target_sr = sr
+            
+            # Ensure 1D mono audio array for consistent concatenation
+            if hasattr(audio_data, "ndim") and audio_data.ndim > 1:
+                audio_data = np.mean(audio_data, axis=1)
             
             combined_audio.append(audio_data)
             
@@ -898,5 +1282,5 @@ def concatenate_voices():
 if __name__ == "__main__":
     # Start server on local port 5555
     print("[Python Server] Starting Flask Voice Cloning Server on port 5555...", flush=True)
-    print(f"[Python Server] Auto-detected models: {json.dumps(scan_installed_models(), indent=2)}", flush=True)
+    threading.Thread(target=_warmup_background, daemon=True).start()
     app.run(host="127.0.0.1", port=5555, debug=False, threaded=True)

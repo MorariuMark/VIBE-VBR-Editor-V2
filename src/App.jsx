@@ -235,7 +235,7 @@ function AppContent() {
         actions.addToast(`Adding ${voices.length} AI Voiceover clips to Media Library...`, 'info');
 
         for (let i = 0; i < voices.length; i++) {
-          const { audioPath, characterName, blockId, characterId, duration, words } = voices[i];
+          const { audioPath, characterName, blockId, characterId, duration, words, mergedVoiceover } = voices[i];
           if (!audioPath) continue;
           const name = audioPath.split(/[\\/]/).pop();
           
@@ -263,8 +263,10 @@ function AppContent() {
             ext: '.wav',
             dataUrl: dataUrl || `file:///${audioPath.replace(/\\/g, '/')}`,
             type: 'audio',
-            isVoiceClone: !!blockId,
-            blockId,
+            isVoiceClone: !!blockId || !!mergedVoiceover,
+            blockId: mergedVoiceover ? undefined : blockId,
+            mergedVoiceover: !!mergedVoiceover,
+            startTime: !mergedVoiceover ? undefined : (voices[i].startTime != null ? voices[i].startTime : 0),
             characterId,
             characterName,
             duration: duration || 0,

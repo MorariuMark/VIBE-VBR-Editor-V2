@@ -127,7 +127,8 @@ export default function AutomationConsole({ isOpen, onToggle, isRunning, setIsRu
 
   const addLog = useCallback((message, type = 'info') => {
     const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogs(prev => [...prev, { message, type, timestamp }]);
+    const id = `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    setLogs(prev => [...prev, { id, message, type, timestamp }]);
 
     // Update current step display for status bar
     if (type === 'system' && message.startsWith('[')) {
@@ -230,6 +231,14 @@ export default function AutomationConsole({ isOpen, onToggle, isRunning, setIsRu
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
   }, [consoleHeight]);
+
+  useEffect(() => {
+    return () => {
+      resizingRef.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isOpen]);
 
   // Tab key handling in textarea
   const handleKeyDown = useCallback((e) => {
@@ -412,7 +421,7 @@ export default function AutomationConsole({ isOpen, onToggle, isRunning, setIsRu
             ) : (
               logs.map((entry, idx) => (
                 <div
-                  key={idx}
+                  key={entry.id || idx}
                   className="automation-console__log-entry"
                   style={{ color: getLogColor(entry.type) }}
                 >

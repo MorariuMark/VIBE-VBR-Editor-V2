@@ -537,7 +537,7 @@ export default function Timeline() {
       return;
     }
 
-    if (window.electronAPI && window.electronAPI.setActiveProjectState) {
+    if (window.electronAPI?.setActiveProjectState && window.electronAPI?.openVoiceCloneWindow) {
       actions.addToast(`Opening Voice Clone to redo line for ${block.characterName}...`, "info");
       await window.electronAPI.setActiveProjectState({
         characters: state.characters,
@@ -1203,7 +1203,7 @@ function AudioWaveformCanvas({ audioBuffer, width, height, color }) {
       ctx.lineWidth = 1;
       ctx.beginPath();
       const mid = height / 2;
-      for (let x = 0; x < width; x++) {
+      for (let x = 0; x < drawW; x++) {
         const y = mid + Math.sin(x * 0.05) * (height * 0.3) * Math.sin(x * 0.002);
         if (x === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
@@ -1214,12 +1214,12 @@ function AudioWaveformCanvas({ audioBuffer, width, height, color }) {
 
     // Draw actual waveform from audio buffer
     const channelData = audioBuffer.getChannelData(0);
-    const samplesPerPixel = Math.floor(channelData.length / width);
+    const samplesPerPixel = Math.floor(channelData.length / drawW);
     const mid = height / 2;
 
     ctx.fillStyle = color + '66';
     
-    for (let x = 0; x < width; x++) {
+    for (let x = 0; x < drawW; x++) {
       let min = 1, max = -1;
       const start = x * samplesPerPixel;
       const end = Math.min(start + samplesPerPixel, channelData.length);

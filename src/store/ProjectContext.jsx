@@ -1,8 +1,9 @@
 import React, { createContext, useContext, useReducer, useRef } from 'react';
 import { parseScript, recalculateTimings, addCustomCharacter, DEFAULT_TEXT_STYLE, estimateDialogueDuration } from '../engine/scriptParser';
 import { matchImageToScript } from '../utils/scriptImageMatcher';
-import { buildLongFormTimeline } from '../engine/longFormParser';
+import { buildLongFormTimeline, extractImageNumber, stripImageNumber } from '../engine/longFormParser';
 import { uid } from '../utils/fileHelpers';
+import { alignWords, distributeMergedWords } from '../engine/renderEngine';
 
 const ProjectContext = createContext(null);
 
@@ -191,14 +192,64 @@ function computeProjectDuration(state) {
 // overlaps, and place them on a video track that does not hold clip_bg.
 // Extends totalDuration and the default background clip when needed.
 // Shared by IMPORT_IMAGE_FOLDER and APPLY_IMAGES_TO_TIMELINE.
+//
+// PRIORITY: images with a numerical prefix ("1_....jpg", "2-cat.png") are
+// applied first, strictly in numeric-prefix order — their number guarantees
+// the timeline order. Each numbered image's duration still follows the naming
+// convention (its phrase span matched against the script), falling back to a
+// 5s clip when it cannot be matched.
+// FALLBACK: images without a number prefix use the current system — matched
+// clips are anchored at their script phrase times, unmatched ones become 5s
+// clips appended at the end.
 function placeImageClips(state, items) {
   const clipDuration = 5;
   const blocks = state.dialogueBlocks || [];
   const MIN_CLIP_DURATION = 0.5;
 
+  const numberedItems = [];
+  const regularItems = [];
+  items.forEach(item => {
+    const num = extractImageNumber(item.name);
+    if (num !== null) {
+      numberedItems.push({ item, num });
+    } else {
+      regularItems.push(item);
+    }
+  });
+  numberedItems.sort((a, b) => a.num - b.num);
+
+  // PRIORITY: numbered images, placed in numeric-prefix order. Each image
+  // starts where the previous numbered image ends (or later, at its own
+  // matched script position) and lasts exactly as long as its naming
+  // convention span in the script.
+  const numberedClips = [];
+  let numberedCursor = 0;
+  numberedItems.forEach(({ item, num }) => {
+    const keywords = stripImageNumber(item.name);
+    const match = keywords && blocks.length > 0 ? matchImageToScript(keywords, blocks) : null;
+    const matched = !!(match && match.endTime - match.startTime >= MIN_CLIP_DURATION);
+    const startTime = matched ? Math.max(match.startTime, numberedCursor) : numberedCursor;
+    const duration = matched
+      ? Math.max(match.endTime - startTime, MIN_CLIP_DURATION)
+      : clipDuration;
+    numberedClips.push({
+      id: `clip_${Date.now()}_${uid()}`,
+      name: item.name,
+      startTime,
+      duration,
+      color: '#444466',
+      path: item.path,
+      dataUrl: item.dataUrl,
+      type: 'image',
+      scriptMatched: matched,
+    });
+    numberedCursor = startTime + duration;
+  });
+
+  // FALLBACK: no number prefix → current naming-convention system.
   const matched = [];
   const unmatched = [];
-  items.forEach(item => {
+  regularItems.forEach(item => {
     const match = blocks.length > 0 ? matchImageToScript(item.name, blocks) : null;
     if (match && match.endTime - match.startTime >= MIN_CLIP_DURATION) {
       matched.push({ item, match });
@@ -209,7 +260,7 @@ function placeImageClips(state, items) {
 
   matched.sort((a, b) => a.match.startTime - b.match.startTime);
   const resolvedClips = [];
-  let cursor = 0;
+  let cursor = numberedCursor;
   matched.forEach(m => {
     const startTime = Math.max(m.match.startTime, cursor);
     const rawDuration = m.match.endTime - startTime;
@@ -239,7 +290,7 @@ function placeImageClips(state, items) {
     type: 'image',
   }));
 
-  const newClips = [...resolvedClips, ...fallbackClips];
+  const newClips = [...numberedClips, ...resolvedClips, ...fallbackClips];
 
   let targetTrack = state.tracks.find(t =>
     t.type === 'video' && !(t.clips || []).some(c => c.id === 'clip_bg' && c.isDefaultDuration)
@@ -842,8 +893,8 @@ function coreProjectReducer(state, action) {
     }
 
     case ActionTypes.ADD_TRACK: {
-      const { type, name, insertBeforeId } = action.payload;
-      const trackId = `${type}_track_${Date.now()}`;
+      const { type, name, insertBeforeId, trackId: customId } = action.payload;
+      const trackId = customId || `${type}_track_${Date.now()}`;
       let color = '#444466';
       if (type === 'audio') color = '#00e5ff';
       else if (type === 'broll') color = '#ffb74d';
@@ -1278,16 +1329,35 @@ function coreProjectReducer(state, action) {
         let text1 = '', text2 = '';
         let words1 = undefined, words2 = undefined;
         
-        if (block.words && block.words.length > 0) {
+        const scriptWords = (block.text || '').split(/\s+/).filter(w => w.length > 0);
+        
+        if (block.words && block.words.length > 0 && scriptWords.length > 0) {
+          // Align the SCRIPT words to the voiceover word timestamps so the
+          // split lands on a real word boundary while both halves keep the
+          // exact original script text (never the transcription).
           const splitOffset = splitTime - block.startTime;
-          words1 = block.words.filter(w => w.start < splitOffset);
-          words2 = block.words.filter(w => w.start >= splitOffset).map(w => ({
+          const aligned = alignWords(scriptWords, block.words);
+
+          let splitIdx = aligned.length;
+          for (let i = 0; i < aligned.length; i++) {
+            if (aligned[i].start >= splitOffset) {
+              splitIdx = i;
+              break;
+            }
+          }
+          if (splitIdx > 0 && splitIdx < aligned.length) {
+            const gapMid = (aligned[splitIdx - 1].start + aligned[splitIdx].start) / 2;
+            if (splitOffset < gapMid) splitIdx--;
+          }
+
+          text1 = scriptWords.slice(0, splitIdx).join(' ');
+          text2 = scriptWords.slice(splitIdx).join(' ');
+          words1 = aligned.slice(0, splitIdx).map(w => ({ ...w }));
+          words2 = aligned.slice(splitIdx).map(w => ({
             ...w,
-            start: w.start - splitOffset,
-            end: w.end - splitOffset,
+            start: Math.max(0, w.start - splitOffset),
+            end: Math.max(0.05, w.end - splitOffset),
           }));
-          text1 = words1.map(w => w.word).join(' ');
-          text2 = words2.map(w => w.word).join(' ');
         } else {
           const ratio = (splitTime - block.startTime) / block.duration;
           const splitIdx = Math.round(block.text.length * ratio);
@@ -1384,6 +1454,16 @@ function coreProjectReducer(state, action) {
       let blocks = [...state.dialogueBlocks];
       let tracks = [...state.tracks];
 
+      // Continuous narration (merged longform voiceover): one free-standing
+      // audio clip holds the word timestamps for the WHOLE script. Slice them
+      // per dialogue block so every caption is script-exact and in sync with
+      // the single voiceover track.
+      const mergedItem = items.find(it => !it.blockId && it.mergedVoiceover && Array.isArray(it.words) && it.words.length > 0);
+      if (mergedItem && blocks.length > 0) {
+        const anchor = mergedItem.startTime != null ? mergedItem.startTime : (blocks[0].startTime || 0);
+        blocks = distributeMergedWords(blocks, mergedItem.words, anchor);
+      }
+
       items.forEach(item => {
         const blockIdx = blocks.findIndex(b => b.id === item.blockId);
         if (blockIdx === -1) return;
@@ -1399,6 +1479,7 @@ function coreProjectReducer(state, action) {
 
       let characterPresenceClips = [...(state.characterPresenceClips || [])];
       items.forEach(item => {
+        if (!item.blockId) return; // free-standing continuous voiceover clip
         const correspondingBlock = blocks.find(b => b.id === item.blockId);
         if (!correspondingBlock) return;
         characterPresenceClips = characterPresenceClips.map(clip => {
@@ -1431,6 +1512,37 @@ function coreProjectReducer(state, action) {
         let clips = [...track.clips];
 
         items.forEach(item => {
+          if (!item.blockId) {
+            // Continuous single-narrator voiceover: one free-standing clip
+            // spanning the whole narration, not tied to a single line.
+            if (tIdx === audioTrackIdx) {
+              const existingClipIdx = clips.findIndex(c => c.mergedVoiceover);
+              if (existingClipIdx !== -1) {
+                clips[existingClipIdx] = {
+                  ...clips[existingClipIdx],
+                  name: item.name,
+                  path: item.path,
+                  dataUrl: item.dataUrl,
+                  startTime: item.startTime != null ? item.startTime : 0,
+                  duration: item.duration,
+                };
+              } else {
+                clips.push({
+                  id: `clip_${Date.now()}_${uid()}`,
+                  name: item.name,
+                  startTime: item.startTime != null ? item.startTime : 0,
+                  duration: item.duration,
+                  color: track.color || '#00e5ff',
+                  path: item.path,
+                  dataUrl: item.dataUrl,
+                  type: 'audio',
+                  isVoiceClone: true,
+                  mergedVoiceover: true,
+                });
+              }
+            }
+            return;
+          }
           const correspondingBlock = blocks.find(b => b.id === item.blockId);
           if (!correspondingBlock) return;
 
@@ -1578,7 +1690,7 @@ function coreProjectReducer(state, action) {
         if (track.type === 'audio') {
           return {
             ...track,
-            clips: track.clips.filter(clip => !clip.blockId),
+            clips: track.clips.filter(clip => !clip.blockId && !clip.mergedVoiceover),
           };
         }
         return track;
@@ -1785,10 +1897,10 @@ function coreProjectReducer(state, action) {
 
     case ActionTypes.DELETE_ALL_VOICES_FROM_LIBRARY: {
       const mediaItems = state.mediaItems.filter(item => !item.isVoiceClone);
-      // Drop timeline clips that referenced deleted voice clones
+      // Drop timeline clips that referenced deleted voice clones or generated voice blocks
       const tracks = state.tracks.map(track => ({
         ...track,
-        clips: (track.clips || []).filter(c => !(c.mediaId && c.mediaId !== c.id && state.mediaItems.find(m => m.id === c.mediaId && m.isVoiceClone))),
+        clips: (track.clips || []).filter(c => !c.isVoiceClone && !c.blockId && !c.mergedVoiceover && !(c.mediaId && state.mediaItems.find(m => m.id === c.mediaId && m.isVoiceClone))),
       }));
       return {
         ...state,
@@ -2077,7 +2189,44 @@ function projectReducer(state, action) {
   const shouldSaveHistory = UNDOABLE_ACTIONS.has(action.type) && !(isDragging && isDragTimingAction);
   const preSnapshot = shouldSaveHistory ? getProjectSnapshot(state) : null;
 
-  const nextState = coreProjectReducer(state, action);
+  const rawState = coreProjectReducer(state, action);
+
+  // Guardrail: no dialogue block may ever exist with empty text. Whatever a
+  // reducer (or a restored project) produced, sanitize here so the voice
+  // clone preview never shows blank lines and generation never sends empty
+  // text to the TTS server. Blocks missing text fall back to their image
+  // name; blocks with neither are dropped entirely.
+  let nextState = rawState;
+  if (rawState && rawState.dialogueBlocks && rawState.dialogueBlocks.length > 0) {
+    const normalizedBlocks = rawState.dialogueBlocks
+      .map(b => ((b.text || '').trim() ? b : { ...b, text: (b.imageName || '').trim() || 'Image' }))
+      .filter(b => (b.text || '').trim());
+    if (normalizedBlocks.length !== rawState.dialogueBlocks.length ||
+        normalizedBlocks.some((b, i) => b.text !== rawState.dialogueBlocks[i].text)) {
+      const characters = rawState.characters || [];
+      const characterPresenceClips = normalizedBlocks.map(b => ({
+        id: `presence_${b.id}`,
+        characterId: b.characterId,
+        startTime: b.startTime,
+        duration: b.duration,
+      }));
+      const totalDuration = recalculateTotalDuration(normalizedBlocks);
+      const tracks = generateTracksFromBlocks(normalizedBlocks, characters, {
+        ...rawState,
+        totalDuration,
+        characterPresenceClips,
+        tracks: rawState.tracks,
+      });
+      nextState = {
+        ...rawState,
+        dialogueBlocks: normalizedBlocks,
+        characters,
+        characterPresenceClips,
+        tracks,
+        totalDuration,
+      };
+    }
+  }
 
   // Pure fallback: if a reducer produced dialogueBlocks without presence
   // clips, derive them instead of mutating nextState in place.
@@ -2443,8 +2592,10 @@ export function ProjectProvider({ children }) {
       dispatch({ type: ActionTypes.BATCH_UPDATE_ANIMATION, payload: { characterId, animation } });
     }),
 
-    addTrack: ((type, name) => {
-      dispatch({ type: ActionTypes.ADD_TRACK, payload: { type, name } });
+    addTrack: ((type, name, insertBeforeId, customTrackId) => {
+      const id = customTrackId || `${type}_track_${Date.now()}`;
+      dispatch({ type: ActionTypes.ADD_TRACK, payload: { type, name, insertBeforeId, trackId: id } });
+      return id;
     }),
 
     removeTrack: ((trackId) => {

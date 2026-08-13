@@ -140,7 +140,7 @@ if (!gotSingleInstanceLock) {
 
 function cleanTemporaryArtifacts() {
   try {
-    const distPath = path.join(__dirname, '..', 'dist');
+    const distPath = path.join(APP_ROOT || path.join(__dirname, '..'), 'dist');
     if (!fs.existsSync(distPath)) return;
 
     // 1. Clean temp_mix_*.wav files in dist
@@ -148,7 +148,7 @@ function cleanTemporaryArtifacts() {
     files.forEach(file => {
       if (file.startsWith('temp_mix_') && file.endsWith('.wav')) {
         const filePath = path.join(distPath, file);
-        fs.unlinkSync(filePath);
+        try { fs.unlinkSync(filePath); } catch (e) {}
       }
     });
 
@@ -158,9 +158,11 @@ function cleanTemporaryArtifacts() {
       const dirs = fs.readdirSync(voicesPath);
       dirs.forEach(dir => {
         const dirPath = path.join(voicesPath, dir);
-        if (fs.statSync(dirPath).isDirectory()) {
-          fs.rmSync(dirPath, { recursive: true, force: true });
-        }
+        try {
+          if (fs.lstatSync(dirPath).isDirectory()) {
+            fs.rmSync(dirPath, { recursive: true, force: true });
+          }
+        } catch (e) {}
       });
     }
     console.log('[Main] Startup temporary files cleanup complete.');
@@ -221,6 +223,25 @@ app.whenReady().then(() => {
   cleanTemporaryArtifacts();
   createWindow();
   startPythonServer();
+});
+
+// Graceful quit: cancel any in-flight voice generation, unload the model
+// from VRAM and let the Python server shut itself down BEFORE the app exits.
+let quitting = false;
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  quitting = true;
+  event.preventDefault();
+  console.log('[Main] Quitting app: stopping voice generation and unloading models...');
+  (async () => {
+    await postVoiceServer('/shutdown');
+    if (pythonServerProcess) {
+      try { pythonServerProcess.kill('SIGTERM'); } catch (e) {}
+      pythonServerProcess = null;
+    }
+    killAllFFmpegProcesses();
+    app.quit();
+  })();
 });
 
 app.on('quit', () => {
@@ -685,7 +706,10 @@ ipcMain.handle('send-frame', async (event, buffer) => {
   return new Promise((resolve) => {
     if (exportProcess && exportProcess.stdin && exportProcess.stdin.writable) {
       try {
-        exportProcess.stdin.write(Buffer.from(buffer), (err) => {
+        const buf = Buffer.isBuffer(buffer)
+          ? buffer
+          : Buffer.from(buffer.buffer || buffer, buffer.byteOffset || 0, buffer.byteLength || buffer.length);
+        exportProcess.stdin.write(buf, (err) => {
           resolve(!err);
         });
       } catch (err) {
@@ -735,6 +759,32 @@ ipcMain.handle('kill-export', async () => {
 
 // ─── Voice Cloning & Python Server Integration ───────────────
 
+const VOICE_SERVER_URL = 'http://127.0.0.1:5555';
+
+// Best-effort POST helper used to stop generation / unload models /
+// shut the server down when windows or the app close.
+async function postVoiceServer(path, body) {
+  try {
+    const res = await fetch(`${VOICE_SERVER_URL}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(4000),
+    });
+    await res.text();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Cancel any in-flight voice generation AND unload the model from VRAM.
+// Used when the voice-clone window closes (the server itself stays alive).
+async function stopVoiceGenerationAndUnload() {
+  await postVoiceServer('/cancel');
+  await postVoiceServer('/unload');
+}
+
 let pythonServerProcess = null;
 
 function startPythonServer() {
@@ -747,7 +797,9 @@ function startPythonServer() {
     return;
   }
 
-  // Fallback chain: project .venv -> bundled venv (resources) -> system python
+  // Fallback chain: project .venv (has priority, everything local) ->
+  // bundled venv (resources) -> system python. Each candidate must pass a
+  // CUDA-aware probe so a CPU-only Python is never silently used.
   const candidates = [];
   if (isWin) {
     candidates.push(
@@ -765,21 +817,35 @@ function startPythonServer() {
     );
   }
 
-  let pythonPath = null;
-  for (const cand of candidates) {
-    if (cand.includes(path.sep) && path.isAbsolute(cand) && fs.existsSync(cand)) {
-      pythonPath = cand;
-      break;
-    }
-    // On PATH
+  function probePython(cand) {
     try {
-      const probe = spawnSync(cand, ['-c', 'import flask, torch; print("ok")'], { timeout: 15000, windowsHide: true, encoding: 'utf8' });
+      const probe = spawnSync(cand, ['-c', 'import flask, numpy, soundfile; print("ok")'], { timeout: 30000, windowsHide: true, encoding: 'utf8' });
       if (probe.status === 0 && probe.stdout && probe.stdout.toString().trim() === 'ok') {
-        pythonPath = cand;
-        break;
+        // Verify torch is present AND CUDA is usable — otherwise the model
+        // would silently fall back to CPU + system RAM.
+        const gpuProbe = spawnSync(cand, ['-c', 'import torch; print("cuda" if torch.cuda.is_available() else "nocuda")'], { timeout: 60000, windowsHide: true, encoding: 'utf8' });
+        const gpuOut = (gpuProbe.stdout || '').toString().trim();
+        if (gpuProbe.status === 0 && gpuOut === 'cuda') {
+          return 'cuda';
+        }
+        return 'nocuda';
       }
     } catch (e) {
       // try next candidate
+    }
+    return null;
+  }
+
+  let pythonPath = null;
+  let pythonCuda = false;
+  for (const cand of candidates) {
+    if (cand.includes(path.sep) && path.isAbsolute(cand) && fs.existsSync(cand)) {
+      const probeResult = probePython(cand);
+      if (probeResult) { pythonPath = cand; pythonCuda = probeResult === 'cuda'; break; }
+    } else {
+      // On PATH
+      const probeResult = probePython(cand);
+      if (probeResult) { pythonPath = cand; pythonCuda = probeResult === 'cuda'; break; }
     }
   }
 
@@ -787,18 +853,31 @@ function startPythonServer() {
     console.log('[Main] No Python with Flask+Torch found. Voice cloning will not be available until the TTS environment is installed (run install_voice_clone.bat).');
     return;
   }
+  if (!pythonCuda) {
+    console.warn(`[Main] WARNING: using ${pythonPath}, but torch.cuda.is_available() is False — voice cloning will run on CPU. Reinstall torch with CUDA support (run install_voice_clone.bat).`);
+  }
 
-  console.log(`[Main] Starting Python Voice Cloning server using: ${pythonPath}`);
+  console.log(`[Main] Starting Python Voice Cloning server using: ${pythonPath} (cuda: ${pythonCuda})`);
 
   // Set project-local cache path
   const hfCachePath = path.join(projectDir, '.hf_cache');
 
+  // Put ffmpeg's folder on PATH so the server's Whisper transcriber can
+  // decode WAVs from disk (it requires the ffmpeg binary).
+  const pythonEnv = { ...process.env, HF_HOME: hfCachePath };
+  try {
+    const ffmpegDir = path.dirname(getFFmpegPath());
+    if (ffmpegDir && ffmpegDir !== '.') {
+      pythonEnv.PATH = `${ffmpegDir}${path.delimiter}${pythonEnv.PATH || ''}`;
+    }
+  } catch (e) {
+    console.warn('[Main] Could not add ffmpeg dir to python PATH:', e.message);
+  }
+
   pythonServerProcess = spawn(pythonPath, [serverScript], {
     cwd: projectDir,
-    env: {
-      ...process.env,
-      HF_HOME: hfCachePath
-    }
+    windowsHide: true,
+    env: pythonEnv
   });
 
   pythonServerProcess.stdout.on('data', (data) => {
@@ -893,6 +972,10 @@ function createVoiceCloneWindow() {
 
   voiceCloneWindow.on('closed', () => {
     voiceCloneWindow = null;
+    // Closing the voice-clone window must IMMEDIATELY stop any in-flight
+    // generation and free the model from VRAM (server stays alive).
+    console.log('[Main] Voice clone window closed. Cancelling generation and unloading model...');
+    stopVoiceGenerationAndUnload();
   });
 }
 
@@ -934,6 +1017,15 @@ ipcMain.on('open-voice-clone-window', () => {
   } else {
     createVoiceCloneWindow();
   }
+});
+
+ipcMain.on('restart-voice-clone-window', () => {
+  if (voiceCloneWindow) {
+    const old = voiceCloneWindow;
+    voiceCloneWindow = null;
+    old.destroy();
+  }
+  setTimeout(() => createVoiceCloneWindow(), 300);
 });
 
 ipcMain.on('open-settings-window', () => {
@@ -999,8 +1091,11 @@ ipcMain.handle('apply-timeline-voices', async (event, payload) => {
   return { success: false, error: 'Main window not available' };
 });
 
-const presetsFilePath = path.join(__dirname, '..', 'presets', 'voice_presets.json');
-const charPresetsFilePath = path.join(__dirname, '..', 'presets', 'character_presets.json');
+const presetsBaseDir = path.join(APP_ROOT || path.join(__dirname, '..'), 'userData', 'presets');
+const presetsFilePath = path.join(presetsBaseDir, 'voice_presets.json');
+const charPresetsFilePath = path.join(presetsBaseDir, 'character_presets.json');
+const mediaPresetsDir = path.join(presetsBaseDir, 'media');
+const mediaPresetsFilePath = path.join(mediaPresetsDir, 'media_presets.json');
 
 ipcMain.handle('save-voice-preset', async (event, preset) => {
   try {
@@ -1077,9 +1172,6 @@ ipcMain.handle('delete-character-preset', async (event, presetName) => {
     return { success: false, error: err.message };
   }
 });
-
-const mediaPresetsDir = path.join(__dirname, '..', 'presets', 'media');
-const mediaPresetsFilePath = path.join(mediaPresetsDir, 'media_presets.json');
 
 ipcMain.handle('save-media-preset', async (event, { filePath, name, type, duration }) => {
   try {
@@ -1168,7 +1260,9 @@ ipcMain.handle('delete-media-preset', async (event, presetId) => {
 });
 
 ipcMain.handle('get-project-path', () => {
-  return path.join(__dirname, '..');
+  // Dev: <root>/electron/.. = <root>. Packaged: __dirname lives inside
+  // app.asar (a virtual archive) -> use APP_ROOT (real, writable) instead.
+  return APP_ROOT || path.join(__dirname, '..');
 });
 
 ipcMain.handle('get-downloads-path', () => {
@@ -1178,13 +1272,33 @@ ipcMain.handle('get-downloads-path', () => {
 
 ipcMain.handle('list-default-voices', async () => {
   try {
-    const voicesDir = path.join(__dirname, '..', 'assets', 'default_voices');
-    if (!fs.existsSync(voicesDir)) return [];
-    const files = fs.readdirSync(voicesDir);
+    const srcVoicesDir = path.join(__dirname, '..', 'assets', 'default_voices');
+    const targetVoicesDir = path.join(APP_ROOT || path.join(__dirname, '..'), 'userData', 'presets', 'default_voices');
+    if (!fs.existsSync(targetVoicesDir)) {
+      fs.mkdirSync(targetVoicesDir, { recursive: true });
+    }
+
+    if (fs.existsSync(srcVoicesDir)) {
+      const files = fs.readdirSync(srcVoicesDir);
+      for (const file of files) {
+        const srcFile = path.join(srcVoicesDir, file);
+        const destFile = path.join(targetVoicesDir, file);
+        try {
+          if (!fs.existsSync(destFile) || fs.statSync(srcFile).mtimeMs > fs.statSync(destFile).mtimeMs) {
+            fs.copyFileSync(srcFile, destFile);
+          }
+        } catch (e) {
+          // ignore copy error fallback
+        }
+      }
+    }
+
+    if (!fs.existsSync(targetVoicesDir)) return [];
+    const files = fs.readdirSync(targetVoicesDir);
     const wavFiles = files.filter(f => f.toLowerCase().endsWith('.wav'));
     const result = [];
     for (const file of wavFiles) {
-      const wavPath = path.join(voicesDir, file);
+      const wavPath = path.join(targetVoicesDir, file);
       const txPath = wavPath + '.txt';
       let transcript = '';
       if (fs.existsSync(txPath)) {
@@ -1215,6 +1329,9 @@ ipcMain.handle('copy-file', async (event, { src, dest }) => {
 ipcMain.handle('mix-audio-clips', async (event, { clips, outputPath }) => {
   return new Promise((resolve) => {
     try {
+      if (!clips || clips.length === 0) {
+        return resolve({ success: false, error: 'No audio clips provided for mixing' });
+      }
       const ffmpegPath = getFFmpegPath();
       const args = ['-y'];
       
@@ -1222,18 +1339,31 @@ ipcMain.handle('mix-audio-clips', async (event, { clips, outputPath }) => {
         args.push('-i', clip.path);
       });
       
-      const filterParts = [];
-      const labels = [];
-      clips.forEach((clip, idx) => {
-        const delayMs = Math.round(clip.startTime * 1000);
-        filterParts.push(`[${idx}:a]adelay=${delayMs}|${delayMs}[a${idx}]`);
-        labels.push(`[a${idx}]`);
-      });
+      if (clips.length === 1) {
+        const delayMs = Math.round((clips[0].startTime || 0) * 1000);
+        if (delayMs > 0) {
+          args.push('-filter_complex', `[0:a]adelay=${delayMs}:all=1[out]`, '-map', '[out]');
+        } else {
+          args.push('-map', '0:a');
+        }
+      } else {
+        const filterParts = [];
+        const labels = [];
+        clips.forEach((clip, idx) => {
+          const delayMs = Math.round((clip.startTime || 0) * 1000);
+          if (delayMs > 0) {
+            filterParts.push(`[${idx}:a]adelay=${delayMs}:all=1[a${idx}]`);
+          } else {
+            filterParts.push(`[${idx}:a]anull[a${idx}]`);
+          }
+          labels.push(`[a${idx}]`);
+        });
+        
+        filterParts.push(`${labels.join('')}amix=inputs=${clips.length}:normalize=0[out]`);
+        args.push('-filter_complex', filterParts.join(';'));
+        args.push('-map', '[out]');
+      }
       
-      filterParts.push(`${labels.join('')}amix=inputs=${clips.length}:normalize=0[out]`);
-      
-      args.push('-filter_complex', filterParts.join(';'));
-      args.push('-map', '[out]');
       args.push(outputPath);
       
       console.log('[Main] Mix audio clips command:', ffmpegPath, args.join(' '));

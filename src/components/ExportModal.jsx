@@ -31,7 +31,7 @@ export default function ExportModal() {
 
   // Query FFmpeg capabilities to auto-detect supported GPU codecs
   useEffect(() => {
-    if (state.showExportModal && window.electronAPI && window.electronAPI.detectGpuCodecs) {
+    if (state.showExportModal && window.electronAPI?.detectGpuCodecs) {
       window.electronAPI.detectGpuCodecs().then((codecs) => {
         setSupportedCodecs(codecs || { h264_nvenc: false, h264_amf: false, h264_qsv: false });
         
@@ -43,7 +43,7 @@ export default function ExportModal() {
         }
       });
     }
-  }, [state.showExportModal, state.exportSettings.codec]);
+  }, [state.showExportModal]);
 
   const handleCancelExport = async () => {
     cancelExportRef.current = true;

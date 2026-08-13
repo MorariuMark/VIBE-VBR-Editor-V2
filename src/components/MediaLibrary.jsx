@@ -240,21 +240,26 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
       }
 
       // Setup progress listener
-      window.electronAPI.onOptimizeProgress((data) => {
-        if (data && data.filePath === item.path && typeof data.percent === 'number') {
-          setOptimizing(prev => ({ ...prev, [item.id]: data.percent }));
-        }
-      });
+      if (window.electronAPI?.onOptimizeProgress) {
+        window.electronAPI.onOptimizeProgress((data) => {
+          if (data && data.filePath === item.path && typeof data.percent === 'number') {
+            setOptimizing(prev => ({ ...prev, [item.id]: data.percent }));
+          }
+        });
+      }
 
       // Call optimizeVideo IPC
+      if (!window.electronAPI?.optimizeVideo) {
+        actions.addToast('Video optimization is not available in this environment.', 'warning');
+        return;
+      }
+
       const result = await window.electronAPI.optimizeVideo({
         filePath: item.path,
         duration: duration || 0
       });
 
-      window.electronAPI.removeOptimizeProgress();
-
-      if (result.success) {
+      if (result && result.success) {
         // Add the optimized item to the media library using its local path URL directly
         const optimizedItem = {
           id: `media_${Date.now()}_${uid()}`,
@@ -269,11 +274,14 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
         actions.addMedia(optimizedItem);
         actions.addToast(`Optimization complete! Created "${optimizedItem.name}"`, 'success');
       } else {
-        actions.addToast(`Optimization failed: ${result.error?.substring(0, 100)}`, 'error');
+        actions.addToast(`Optimization failed: ${result?.error?.substring(0, 100) || 'Unknown error'}`, 'error');
       }
     } catch (err) {
       actions.addToast(`Optimization error: ${err.message}`, 'error');
     } finally {
+      if (window.electronAPI?.removeOptimizeProgress) {
+        window.electronAPI.removeOptimizeProgress();
+      }
       setOptimizing(prev => {
         const next = { ...prev };
         delete next[item.id];
@@ -361,6 +369,22 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
   };
 
   const handleAutoApplyVoice = (item) => {
+    if (item.mergedVoiceover) {
+      // Single continuous voiceover: one free-standing clip on the audio
+      // track anchored at the first dialogue block, spanning the narration.
+      const firstBlock = state.dialogueBlocks[0];
+      actions.applyVoices([{
+        startTime: firstBlock ? firstBlock.startTime : (item.startTime != null ? item.startTime : 0),
+        duration: item.duration || 3.0,
+        words: item.words || [],
+        name: item.name,
+        path: item.path,
+        dataUrl: item.dataUrl,
+      }]);
+      actions.addToast(`Applied continuous voiceover clip to the timeline!`, "success");
+      return;
+    }
+
     const block = resolveBlockForVoice(item);
     if (!block) {
       actions.addToast("Could not find matching dialogue block for this voice clone.", "warning");
@@ -385,7 +409,17 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
     
     voiceItems.forEach(item => {
       const block = resolveBlockForVoice(item);
-      if (block) {
+      if (item.mergedVoiceover) {
+        const firstBlock = state.dialogueBlocks[0];
+        voicesToApply.push({
+          startTime: firstBlock ? firstBlock.startTime : (item.startTime != null ? item.startTime : 0),
+          duration: item.duration || 3.0,
+          words: item.words || [],
+          name: item.name,
+          path: item.path,
+          dataUrl: item.dataUrl,
+        });
+      } else if (block) {
         voicesToApply.push({
           blockId: block.id,
           duration: item.duration || 3.0,
@@ -903,7 +937,7 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
                             color: '#00e5ff',
                             zIndex: 10
                           }}
-                          onClick={(e) => { e.stopPropagation(); handleSetPresetAsBackground(preset); }}
+                          onClick={(e) => { e.stopPropagation(); handleApplyPresetItem(preset); }}
                           title="Apply background video"
                         >
                           BG
@@ -922,7 +956,7 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
                             color: '#00e5ff',
                             zIndex: 10
                           }}
-                          onClick={(e) => { e.stopPropagation(); handleAssignPresetToCharacter(preset); }}
+                          onClick={(e) => { e.stopPropagation(); handleApplyPresetItem(preset); }}
                           title="Assign to character"
                         >
                           Asset
@@ -943,7 +977,7 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
                             color: '#00e5ff',
                             display: 'flex', alignItems: 'center', justifyContent: 'center'
                           }}
-                          onClick={(e) => { e.stopPropagation(); handleSetPresetAsAudio(preset); }}
+                          onClick={(e) => { e.stopPropagation(); handleApplyPresetItem(preset); }}
                           title="Set as dialogue audio"
                         >
                           Audio

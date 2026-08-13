@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Voice Cloning
   openVoiceCloneWindow: () => ipcRenderer.send('open-voice-clone-window'),
+  restartVoiceCloneWindow: () => ipcRenderer.send('restart-voice-clone-window'),
   setActiveProjectState: (state) => ipcRenderer.invoke('set-active-project-state', state),
   getActiveProjectState: () => ipcRenderer.invoke('get-active-project-state'),
   applyTimelineVoices: (config) => ipcRenderer.invoke('apply-timeline-voices', config),

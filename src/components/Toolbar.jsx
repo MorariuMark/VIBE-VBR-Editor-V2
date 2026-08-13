@@ -126,7 +126,8 @@ export default function Toolbar({ onToggleConsole, isConsoleOpen }) {
       await window.electronAPI.setActiveProjectState({
         characters: state.characters,
         dialogueBlocks: state.dialogueBlocks,
-        voiceConfigs: state.voiceConfigs
+        voiceConfigs: state.voiceConfigs,
+        scriptText: state.scriptText || ''
       });
       window.electronAPI.openVoiceCloneWindow();
     } else {

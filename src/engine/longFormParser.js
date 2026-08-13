@@ -31,8 +31,16 @@ export function extractImageNumber(name) {
 export function stripImageNumber(name) {
   return String(name || '')
     .replace(/\.[^.]+$/, '')
-    .replace(/^\d+[\s._-]+/, '')
+    .replace(/^\d+(?:[\s._-]+|$)/, '')
     .trim();
+}
+
+// Fallback speech text for images that could not be matched to the script.
+// Guarantees a block never ends up with empty text, no matter what the
+// script or the image filenames look like.
+function segmentFallbackText(image) {
+  const base = String(image?.name || '').replace(/\.[^.]+$/, '');
+  return stripImageNumber(base) || base || 'Image';
 }
 
 // Mirrors the corpus used by the image matcher, but keeps the original-case
@@ -120,7 +128,7 @@ function buildNumberedSegments(images, corpus, srcBlocks, narratorId) {
         match: null,
         startTime: prevEndTime,
         duration: DEFAULT_CLIP_DURATION,
-        text: '',
+        text: segmentFallbackText(item.image),
         characterId: narratorId,
         words: [],
         scriptMatched: false,
@@ -136,8 +144,9 @@ function buildNumberedSegments(images, corpus, srcBlocks, narratorId) {
       if (anchors[j]) { nextAnchorIdx = j; break; }
     }
 
-    const startPos = anchor.startPos;
-    const endPos = nextAnchorIdx === -1 ? lastCorpusIdx : anchors[nextAnchorIdx].startPos - 1;
+    const startPos = Math.min(anchor.startPos, lastCorpusIdx);
+    const rawEndPos = nextAnchorIdx === -1 ? lastCorpusIdx : anchors[nextAnchorIdx].startPos - 1;
+    const endPos = Math.max(startPos, Math.min(rawEndPos, lastCorpusIdx));
     const slice = corpus.slice(startPos, endPos + 1);
     if (!slice.length) {
       segments.push({
@@ -146,7 +155,7 @@ function buildNumberedSegments(images, corpus, srcBlocks, narratorId) {
         match: null,
         startTime: prevEndTime,
         duration: DEFAULT_CLIP_DURATION,
-        text: '',
+        text: segmentFallbackText(item.image),
         characterId: narratorId,
         words: [],
         scriptMatched: false,
@@ -158,7 +167,7 @@ function buildNumberedSegments(images, corpus, srcBlocks, narratorId) {
 
     const startTime = Math.max(wordTime(corpus[startPos], false), prevEndTime);
     let endTime;
-    if (nextAnchorIdx === -1) {
+    if (nextAnchorIdx === -1 || !anchors[nextAnchorIdx] || anchors[nextAnchorIdx].startPos >= corpus.length) {
       // Last image: cover through the very end of the script.
       endTime = Math.max(wordTime(corpus[lastCorpusIdx], true), lastBlockEndTime);
     } else {
@@ -183,6 +192,76 @@ function buildNumberedSegments(images, corpus, srcBlocks, narratorId) {
       endMatched: nextAnchorIdx === -1 ? !!anchor.endMatched : false,
     });
     prevEndTime = startTime + duration;
+  });
+
+  return segments;
+}
+
+/**
+ * Mixed-mode segmentation (numbered PRIORITY + keyword fallback).
+ *
+ * Used when SOME images carry a number prefix. Numbered images are applied
+ * first, strictly in numeric order: each starts after the previous numbered
+ * image (or later at its own matched script position) and lasts exactly its
+ * naming-convention span. Images without a number prefix then follow the
+ * current keyword system, chained after the numbered group so nothing
+ * overlaps and the numeric order is never violated.
+ */
+function buildMixedSegments(images, corpus, srcBlocks, narratorId) {
+  const numbered = [];
+  const regular = [];
+  images.forEach(image => {
+    const num = extractImageNumber(image.name);
+    if (num !== null) numbered.push({ image, num });
+    else regular.push(image);
+  });
+  numbered.sort((a, b) => a.num - b.num);
+
+  const segments = [];
+  let prevEndTime = 0;
+
+  const pushSegment = (item, startTime, duration, match) => {
+    const slice = match ? corpus.slice(match.startPos, match.endPos + 1) : [];
+    segments.push({
+      image: item.image,
+      blockId: `block_img_${item.idx}`,
+      match: match ? { startTime, endTime: startTime + duration } : null,
+      startTime,
+      duration,
+      text: slice.length ? slice.map(e => e.original).join(' ').trim() : segmentFallbackText(item.image),
+      characterId: slice.length ? (slice[0].block.characterId || narratorId) : narratorId,
+      words: slice.map(e => ({
+        text: e.text,
+        start: Math.max(0, wordTime(e, false) - startTime),
+        end: Math.max(0.05, wordTime(e, true) - startTime),
+      })),
+      scriptMatched: !!match,
+      endMatched: !!match && !!match.endMatched,
+    });
+    prevEndTime = startTime + duration;
+  };
+
+  numbered.forEach(({ image, num }) => {
+    const keywords = stripImageNumber(image.name);
+    const match = keywords ? matchImageToScriptDetailed(keywords, srcBlocks) : null;
+    if (!match) {
+      pushSegment({ image, idx: images.indexOf(image) }, prevEndTime, DEFAULT_CLIP_DURATION, null);
+      return;
+    }
+    const startTime = Math.max(match.startTime, prevEndTime);
+    const duration = Math.max(match.endTime - startTime, MIN_CLIP_DURATION);
+    pushSegment({ image, idx: images.indexOf(image) }, startTime, duration, match);
+  });
+
+  regular.forEach((image, idx) => {
+    const match = matchImageToScriptDetailed(stripImageNumber(image.name), srcBlocks);
+    if (!match) {
+      pushSegment({ image, idx }, prevEndTime, DEFAULT_CLIP_DURATION, null);
+      return;
+    }
+    const startTime = Math.max(match.startTime, prevEndTime);
+    const duration = Math.max(match.endTime - startTime, MIN_CLIP_DURATION);
+    pushSegment({ image, idx }, startTime, duration, match);
   });
 
   return segments;
@@ -229,13 +308,19 @@ export function buildLongFormTimeline(scriptText, images) {
   const corpus = buildCorpus(srcBlocks);
   if (corpus.length === 0) return { blocks: [], characters, clips: [] };
 
-  // 1. PRIORITY: if every image starts with a number prefix ("1-....png"),
-  //    use the numbered segmentation (sorted by number, chained until the
-  //    next image's keywords). Otherwise fall back to the naming convention.
-  const numberedMode = images.length > 0 && images.every(img => extractImageNumber(img.name) !== null);
+  // 1. PRIORITY: number-prefixed images ("1-....png") are applied first,
+  //    sorted by their number, guaranteeing the timeline order. When ALL
+  //    images are numbered, the numbered segmentation chains them across the
+  //    script; when only some are, the mixed builder appends the unnumbered
+  //    images after the numbered chain. Without any number prefix the naming
+  //    convention alone drives placement.
+  const allNumbered = images.length > 0 && images.every(img => extractImageNumber(img.name) !== null);
+  const anyNumbered = images.some(img => extractImageNumber(img.name) !== null);
   let segments;
-  if (numberedMode) {
+  if (allNumbered) {
     segments = buildNumberedSegments(images, corpus, srcBlocks, narratorId);
+  } else if (anyNumbered) {
+    segments = buildMixedSegments(images, corpus, srcBlocks, narratorId);
   } else {
     segments = images.map((image, idx) => {
       // Strip a leading number (e.g. "1-cat.png") before keyword matching so
@@ -251,7 +336,7 @@ export function buildLongFormTimeline(scriptText, images) {
           match,
           startTime,
           duration,
-          text: slice.map(e => e.original).join(' ').trim() || image.name.replace(/\.[^.]+$/, ''),
+          text: slice.map(e => e.original).join(' ').trim() || segmentFallbackText(image),
           characterId: slice.length ? (slice[0].block.characterId || narratorId) : narratorId,
           words: slice.map(e => ({
             text: e.text,
@@ -268,7 +353,7 @@ export function buildLongFormTimeline(scriptText, images) {
         match: null,
         startTime: 0,
         duration: DEFAULT_CLIP_DURATION,
-        text: '',
+        text: segmentFallbackText(image),
         characterId: narratorId,
         words: [],
         scriptMatched: false,
@@ -279,6 +364,7 @@ export function buildLongFormTimeline(scriptText, images) {
 
   // 2. Chain the segments continuously: first image starts at 0, every next
   //    image starts exactly where the previous one ends. No blank gaps.
+  const charNames = new Map((characters || []).map(c => [c.id, c.name]));
   const blocks = [];
   const clips = [];
   let cursor = 0;
@@ -288,7 +374,8 @@ export function buildLongFormTimeline(scriptText, images) {
     blocks.push({
       id: seg.blockId,
       characterId: seg.characterId,
-      text: seg.text,
+      characterName: seg.characterName || charNames.get(seg.characterId) || 'Narrator',
+      text: (seg.text || '').trim() || segmentFallbackText(seg.image),
       startTime,
       duration,
       words: seg.words,

@@ -546,10 +546,16 @@ export function createExecutor(actions, getState, log) {
         const charName = sanitizeFilename(block.characterName || 'character');
         const savePath = `${voicesDir}/voice_${i + 1}_${charName}.wav`;
 
-        log(`   [${i + 1}/${state.dialogueBlocks.length}] "${block.characterName}": "${block.text.substring(0, 50)}${block.text.length > 50 ? '...' : ''}"`, 'info');
+        const lineText = (block.text || '').trim();
+        if (!lineText) {
+          log(`   ⚠ Skipping line ${i + 1} — no text to synthesize (${block.imageName || block.characterName || 'empty line'}).`, 'warning');
+          continue;
+        }
+
+        log(`   [${i + 1}/${state.dialogueBlocks.length}] "${block.characterName || 'Narrator'}": "${lineText.substring(0, 50)}${lineText.length > 50 ? '...' : ''}"`, 'info');
 
         const bodyPayload = {
-          text: block.text,
+          text: lineText,
           language: 'English',
           ref_audio: config.refPath,
           ref_text: config.refText,
@@ -798,11 +804,14 @@ export function createExecutor(actions, getState, log) {
         // Resolve relative paths against user's Downloads folder
         if (!outputPath.includes(':') && !outputPath.startsWith('/') && !outputPath.startsWith('\\')) {
           // Relative path - put in Downloads if it looks like just a filename
-          let downloadsDir = 'C:\\Users\\User\\Downloads';
+          let downloadsDir = '';
           if (window.electronAPI?.getDownloadsPath) {
             downloadsDir = await window.electronAPI.getDownloadsPath();
           }
-          outputPath = `${downloadsDir}\\${outputPath}`;
+          if (downloadsDir) {
+            const sep = downloadsDir.includes('\\') ? '\\' : '/';
+            outputPath = downloadsDir.endsWith(sep) ? downloadsDir + outputPath : downloadsDir + sep + outputPath;
+          }
         }
         // Ensure .mp4 extension
         if (!outputPath.toLowerCase().endsWith('.mp4')) {
@@ -1228,6 +1237,7 @@ export function createExecutor(actions, getState, log) {
 
     let ip = 0;
     const variables = {};
+    const forLoopStates = new Set();
     let loopBudget = 0;
 
     while (ip < commands.length) {
@@ -1286,11 +1296,13 @@ export function createExecutor(actions, getState, log) {
           throw new Error(`FOR loop range (${startVal} TO ${endVal}) exceeds the ${MAX_LOOP_ITERATIONS} iteration limit (line ${cmd.line})`);
         }
 
-        if (!variables.hasOwnProperty(varName)) {
+        if (!forLoopStates.has(ip)) {
+          forLoopStates.add(ip);
           variables[varName] = startVal;
         }
 
-        if (variables[varName] > endVal) {
+        if (parseInt(variables[varName]) > endVal) {
+          forLoopStates.delete(ip);
           delete variables[varName];
           ip = jumpTargets[ip]; // Exit loop
         } else {

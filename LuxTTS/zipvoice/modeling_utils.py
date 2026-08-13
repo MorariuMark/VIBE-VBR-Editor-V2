@@ -54,6 +54,9 @@ def process_audio(audio, transcriber, tokenizer, feature_extractor, device, targ
         prompt_wav, sr = librosa.load(audio, sr=24000, duration=duration)
 
     if not prompt_text:
+        if transcriber is None:
+            print("[LuxTTS] Lazily initializing Whisper ASR transcriber for missing prompt text...", flush=True)
+            transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-base", device=device)
         if duration is None:
             prompt_wav2, sr2 = librosa.load(audio, sr=16000, duration=None)
             max_dur = 15.0
@@ -113,7 +116,7 @@ def load_models_gpu(model_path=None, device="cuda"):
     model_ckpt = f"{model_path}/model.pt"
     model_config = f"{model_path}/config.json"
 
-    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-base", device=device)
+    transcriber = None
     tokenizer = EmiliaTokenizer(token_file=token_file)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
@@ -150,7 +153,7 @@ def load_models_cpu(model_path = None, num_thread=2):
     fm_decoder_path = f"{model_path}/fm_decoder.onnx"
     model_config  = f"{model_path}/config.json"
 
-    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device='cpu')
+    transcriber = None
 
     tokenizer = EmiliaTokenizer(token_file=token_file)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}

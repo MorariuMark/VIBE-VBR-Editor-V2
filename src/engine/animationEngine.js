@@ -1,5 +1,27 @@
 import { getEasedProgress, evaluateCatmullRomSpline } from './easingEngine';
 
+// ─── Easing Functions ───
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function easeInCubic(t) {
+  return t * t * t;
+}
+
+function easeOutBack(t) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+
+function easeInBack(t) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return c3 * t * t * t - c1 * t * t;
+}
+
 // Available animation presets
 export const ANIMATION_PRESETS = {
   entrance: {
@@ -214,42 +236,20 @@ export const ANIMATION_PRESETS = {
   },
 };
 
-// ─── Easing Functions ───
-
-function easeOutCubic(t) {
-  return 1 - Math.pow(1 - t, 3);
-}
-
-function easeInCubic(t) {
-  return t * t * t;
-}
-
-function easeOutBack(t) {
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
-}
-
-function easeInBack(t) {
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return c3 * t * t * t - c1 * t * t;
-}
-
 /**
  * Calculate the animated properties of a character element at a given time.
- * 
- * @param {Object} block - The dialogue block with timing info
- * @param {Object} element - The element's base transform { x, y, scale, rotation }
- * @param {number} currentTime - Current playback time in seconds
- * @returns {Object|null} - Animated properties or null if not visible
  */
 export function getAnimatedTransform(block, element, currentTime) {
-  const { startTime, duration, animation } = block;
+  if (!block || !element) return null;
+  const startTime = block.startTime || 0;
+  const duration = block.duration || 0;
   const endTime = startTime + duration;
   
-  // Fallbacks for animation object
-  const anim = animation || {};
+  if (currentTime < startTime || currentTime >= endTime) {
+    return null;
+  }
+  
+  const anim = block.animation || {};
   const entrance = anim.entrance || 'slide-up';
   const exit = anim.exit || 'slide-down';
   const entranceDur = anim.entranceDuration ?? 0.3;
@@ -258,20 +258,14 @@ export function getAnimatedTransform(block, element, currentTime) {
   const sustainIntensity = anim.sustainIntensity ?? 0.5;
   const sustainSpeed = anim.sustainSpeed ?? 0.5;
   
-  // Not in range at all
-  if (currentTime < startTime || currentTime > endTime) {
-    return null;
-  }
-  
   const elapsed = currentTime - startTime;
   const remaining = endTime - currentTime;
   
-  // 1. Calculate base transform with sustain effects
   let baseTransform = {
-    x: element.x,
-    y: element.y,
-    scale: element.scale,
-    rotation: element.rotation,
+    x: element.x ?? 0,
+    y: element.y ?? 0,
+    scale: element.scale ?? 1,
+    rotation: element.rotation ?? 0,
     opacity: 1,
     skewX: element.skewX ?? 0,
     skewY: element.skewY ?? 0,
@@ -280,44 +274,36 @@ export function getAnimatedTransform(block, element, currentTime) {
     flipX: element.flipX ?? 1,
     flipY: element.flipY ?? 1,
   };
-  
+
+  if (Array.isArray(anim.keyframes) && anim.keyframes.length > 0) {
+    const kfTransform = getInterpolatedKeyframeTransform(anim.keyframes, elapsed, element);
+    if (kfTransform) {
+      baseTransform = { ...baseTransform, ...kfTransform };
+    }
+  }
+
   if (sustain === 'shake') {
     const t = currentTime;
-    const dx = Math.sin(t * sustainSpeed * 25) * sustainIntensity * 15;
-    const dy = Math.cos(t * sustainSpeed * 22) * sustainIntensity * 15;
-    const dr = Math.sin(t * sustainSpeed * 18) * sustainIntensity * 6;
-    baseTransform.x += dx;
-    baseTransform.y += dy;
-    baseTransform.rotation += dr;
+    baseTransform.x += Math.sin(t * sustainSpeed * 25) * sustainIntensity * 15;
+    baseTransform.y += Math.cos(t * sustainSpeed * 22) * sustainIntensity * 15;
+    baseTransform.rotation += Math.sin(t * sustainSpeed * 18) * sustainIntensity * 6;
   } else if (sustain === 'move-around') {
     const t = currentTime;
-    const dx = Math.sin(t * sustainSpeed * 4) * sustainIntensity * 50;
-    const dy = Math.cos(t * sustainSpeed * 3) * sustainIntensity * 40;
-    const dr = Math.sin(t * sustainSpeed * 2) * sustainIntensity * 8;
-    baseTransform.x += dx;
-    baseTransform.y += dy;
-    baseTransform.rotation += dr;
+    baseTransform.x += Math.sin(t * sustainSpeed * 4) * sustainIntensity * 50;
+    baseTransform.y += Math.cos(t * sustainSpeed * 3) * sustainIntensity * 40;
+    baseTransform.rotation += Math.sin(t * sustainSpeed * 2) * sustainIntensity * 8;
   } else if (sustain === 'bounce-idle') {
-    const t = currentTime;
-    const dy = -Math.abs(Math.sin(t * sustainSpeed * 10)) * sustainIntensity * 30;
-    baseTransform.y += dy;
+    baseTransform.y += -Math.abs(Math.sin(currentTime * sustainSpeed * 10)) * sustainIntensity * 30;
   } else if (sustain === 'breath') {
-    const t = currentTime;
-    const ds = Math.sin(t * sustainSpeed * 6) * sustainIntensity * 0.15;
-    baseTransform.scale *= (1 + ds);
+    baseTransform.scale *= (1 + Math.sin(currentTime * sustainSpeed * 6) * sustainIntensity * 0.15);
   } else if (sustain === 'float') {
-    const t = currentTime;
-    const dy = Math.sin(t * sustainSpeed * 4) * sustainIntensity * 25;
-    baseTransform.y += dy;
+    baseTransform.y += Math.sin(currentTime * sustainSpeed * 4) * sustainIntensity * 25;
   } else if (sustain === 'dance') {
     const t = currentTime;
-    const dx = Math.sin(t * sustainSpeed * 6) * sustainIntensity * 20;
-    const dr = Math.cos(t * sustainSpeed * 6) * sustainIntensity * 10;
-    baseTransform.x += dx;
-    baseTransform.rotation += dr;
+    baseTransform.x += Math.sin(t * sustainSpeed * 6) * sustainIntensity * 20;
+    baseTransform.rotation += Math.cos(t * sustainSpeed * 6) * sustainIntensity * 10;
   }
-  
-  // 2. Entrance phase
+
   if (elapsed < entranceDur && entranceDur > 0) {
     const progress = elapsed / entranceDur;
     const preset = ANIMATION_PRESETS.entrance[entrance];
@@ -327,7 +313,6 @@ export function getAnimatedTransform(block, element, currentTime) {
     }
   }
   
-  // 3. Exit phase
   if (remaining < exitDur && exitDur > 0) {
     const progress = 1 - (remaining / exitDur);
     const preset = ANIMATION_PRESETS.exit[exit];
@@ -340,42 +325,26 @@ export function getAnimatedTransform(block, element, currentTime) {
   return baseTransform;
 }
 
-/**
- * Check if a character should be visible at the given time.
- */
 function isBlockActive(block, currentTime) {
-  // End boundary is exclusive so back-to-back blocks never overlap by a frame
+  if (!block) return false;
   return currentTime >= block.startTime && currentTime < (block.startTime + block.duration);
 }
 
-/**
- * Get all active blocks at a given time.
- */
 export function getActiveBlocks(blocks, currentTime) {
+  if (!Array.isArray(blocks)) return [];
   return blocks.filter(block => isBlockActive(block, currentTime));
 }
 
-/**
- * Calculate the interpolated transform of a character based on its keyframes at a given time.
- * Supports Linear, Smooth Spline Curve, Ease-In, Ease-Out, Ease-In-Out, Bounce, Back Overshoot, and Hold.
- */
-export function getInterpolatedKeyframeTransform(keyframes, time) {
-  if (!keyframes || keyframes.length === 0) return null;
-  
+export function getInterpolatedKeyframeTransform(keyframes, time, baseElement = {}) {
+  if (!Array.isArray(keyframes) || keyframes.length === 0) return null;
   const sorted = [...keyframes].sort((a, b) => a.time - b.time);
   
-  if (time <= sorted[0].time) {
-    return { ...sorted[0] };
-  }
-  if (time >= sorted[sorted.length - 1].time) {
-    return { ...sorted[sorted.length - 1] };
-  }
+  if (time <= sorted[0].time) return { ...sorted[0] };
+  if (time >= sorted[sorted.length - 1].time) return { ...sorted[sorted.length - 1] };
   
   let i = 0;
-  for (; i < sorted.length - 1; i++) {
-    if (time >= sorted[i].time && time < sorted[i+1].time) {
-      break;
-    }
+  while (i < sorted.length - 1 && sorted[i+1].time <= time) {
+    i++;
   }
   
   const kf1 = sorted[i];
@@ -390,8 +359,9 @@ export function getInterpolatedKeyframeTransform(keyframes, time) {
   const lerp = (v1, v2, p) => v1 + (v2 - v1) * p;
 
   const interpolateVal = (prop) => {
-    const val1 = kf1[prop] ?? 0;
-    const val2 = kf2[prop] ?? 0;
+    const defaultVal = prop === 'scale' ? (baseElement.scale ?? 1) : 0;
+    const val1 = kf1[prop] ?? defaultVal;
+    const val2 = kf2[prop] ?? defaultVal;
 
     if (easing === 'smoothSpline') {
       const val0 = p0[prop] ?? val1;
@@ -403,24 +373,29 @@ export function getInterpolatedKeyframeTransform(keyframes, time) {
     return lerp(val1, val2, easedP);
   };
 
-  // flipX/flipY default to 1 when not keyframed; interpolating -1..1 passes
-  // through 0, so `|| 1` must not snap it back to 1 mid-transition.
   const interpolateFlip = (prop) => {
-    const val1 = kf1[prop] ?? 1;
-    const val2 = kf2[prop] ?? 1;
+    const defaultVal = baseElement[prop] ?? 1;
+    const val1 = kf1[prop] ?? defaultVal;
+    const val2 = kf2[prop] ?? defaultVal;
     if (easing === 'smoothSpline') {
-      return evaluateCatmullRomSpline(val1, val2, val2, val2, rawProgress);
+      const val0 = p0[prop] ?? val1;
+      const val3 = p3[prop] ?? val2;
+      return evaluateCatmullRomSpline(val0, val1, val2, val3, rawProgress);
     }
     return lerp(val1, val2, getEasedProgress(easing, rawProgress));
   };
   
+  const op1 = kf1.opacity ?? 1;
+  const op2 = kf2.opacity ?? 1;
+  const opacityVal = lerp(op1, op2, getEasedProgress(easing, rawProgress));
+
   return {
     time,
     x: interpolateVal('x'),
     y: interpolateVal('y'),
     scale: interpolateVal('scale'),
     rotation: interpolateVal('rotation'),
-    opacity: kf1.opacity !== undefined && kf2.opacity !== undefined ? interpolateVal('opacity') : 1,
+    opacity: opacityVal,
     skewX: interpolateVal('skewX'),
     skewY: interpolateVal('skewY'),
     rotateX: interpolateVal('rotateX'),

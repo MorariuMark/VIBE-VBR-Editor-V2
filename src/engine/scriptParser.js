@@ -222,11 +222,18 @@ export function detectSilenceSegments(audioBuffer, threshold = 0.02, minSilenceD
   }
   
   // Handle final segment
+  const totalDuration = channelData.length / sampleRate;
   if (inSpeech) {
     segments.push({
       start: speechStart,
-      end: channelData.length / sampleRate,
-      duration: (channelData.length / sampleRate) - speechStart,
+      end: totalDuration,
+      duration: totalDuration - speechStart,
+    });
+  } else if (silenceStart > 0 && speechStart < silenceStart) {
+    segments.push({
+      start: speechStart,
+      end: silenceStart,
+      duration: silenceStart - speechStart,
     });
   }
   
@@ -289,9 +296,9 @@ export function recalculateTimings(blocks, changedIndex, oldBlock) {
 }
 
 export function addCustomCharacter(existingCharacters, nameOrObj) {
-  const colorIndex = existingCharacters.length;
+  const colorIndex = existingCharacters ? existingCharacters.length : 0;
   const isObj = nameOrObj && typeof nameOrObj === 'object';
-  const name = isObj ? nameOrObj.name : nameOrObj;
+  const name = (isObj ? nameOrObj.name : nameOrObj) || `Character ${colorIndex + 1}`;
   const id = isObj && nameOrObj.id ? nameOrObj.id : `char_${name.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`;
   return {
     id: id,

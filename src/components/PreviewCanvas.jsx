@@ -85,15 +85,12 @@ export default function PreviewCanvas() {
     });
   }, [state.tracks]);
 
-  // ── Sync multi-track audio playback and seek ──
-  useEffect(() => {
-    const audioClips = state.tracks
-      .filter(t => t.type === 'audio')
-      .flatMap(t => t.clips);
-
-    const now = state.currentTime;
-    const isPlaying = state.isPlaying;
-
+  // ── Audio playback sync core ──
+  // Shared by the sync effect below AND the playback tick. The tick drives
+  // official playback time (localTimeRef) while state.currentTime stays
+  // frozen, so without this the next clip would never start when the
+  // playhead crosses a block boundary.
+  const syncAudioPlayback = useCallback((now, isPlaying, audioClips) => {
     audioClips.forEach(clip => {
       let audioEl = audioElementsRef.current[clip.id];
       const srcUrl = clip.dataUrl || `file:///${clip.path.replace(/\\/g, '/')}`;
@@ -108,8 +105,10 @@ export default function PreviewCanvas() {
         audioElementsRef.current[clip.id] = audioEl;
       }
 
-      // Apply volume and speed
-      audioEl.volume = clip.volume ?? 1.0;
+      // Volumes during playback are owned by the playback tick (fades).
+      if (!isPlaying) {
+        audioEl.volume = clip.volume ?? 1.0;
+      }
       // Note: playbackRate needs to be set after source is loaded/changed
       audioEl.playbackRate = clip.speed ?? 1.0;
 
@@ -142,18 +141,19 @@ export default function PreviewCanvas() {
         delete audioElementsRef.current[id];
       }
     });
-  }, [state.currentTime, state.isPlaying, state.tracks]);
+  }, []);
 
-  // ── Sync multi-track video playback and seek ──
+  // ── Sync multi-track audio playback and seek ──
   useEffect(() => {
-    const videoClips = state.tracks
-      .filter(t => t.type === 'video' || t.type === 'broll' || t.type === 'window')
-      .flatMap(t => t.clips)
-      .filter(c => c.type === 'video');
+    const audioClips = state.tracks
+      .filter(t => t.type === 'audio')
+      .flatMap(t => t.clips);
 
-    const now = state.currentTime;
-    const isPlaying = state.isPlaying;
+    syncAudioPlayback(state.currentTime, state.isPlaying, audioClips);
+  }, [state.currentTime, state.isPlaying, state.tracks, syncAudioPlayback]);
 
+  // ── Video playback sync core (same pattern as audio) ──
+  const syncVideoPlayback = useCallback((now, isPlaying, videoClips) => {
     videoClips.forEach(clip => {
       let videoEl = videoElementsRef.current[clip.id];
       const srcUrl = clip.dataUrl || `file:///${clip.path.replace(/\\/g, '/')}`;
@@ -178,9 +178,11 @@ export default function PreviewCanvas() {
         videoElementsRef.current[clip.id] = videoEl;
       }
 
-      // Apply volume and speed
-      videoEl.muted = (clip.volume ?? 1.0) === 0;
-      videoEl.volume = clip.volume ?? 1.0;
+      // Volumes during playback are owned by the playback tick (fades).
+      if (!isPlaying) {
+        videoEl.muted = (clip.volume ?? 1.0) === 0;
+        videoEl.volume = clip.volume ?? 1.0;
+      }
       videoEl.playbackRate = clip.speed ?? 1.0;
 
       const isActive = now >= clip.startTime && now < (clip.startTime + clip.duration);
@@ -214,7 +216,17 @@ export default function PreviewCanvas() {
         delete videoElementsRef.current[id];
       }
     });
-  }, [state.currentTime, state.isPlaying, state.tracks]);
+  }, []);
+
+  // ── Sync multi-track video playback and seek ──
+  useEffect(() => {
+    const videoClips = state.tracks
+      .filter(t => t.type === 'video' || t.type === 'broll' || t.type === 'window')
+      .flatMap(t => t.clips)
+      .filter(c => c.type === 'video');
+
+    syncVideoPlayback(state.currentTime, state.isPlaying, videoClips);
+  }, [state.currentTime, state.isPlaying, state.tracks, syncVideoPlayback]);
 
   const [gpuEnabled, setGpuEnabled] = useState(false);
   const [preRenderProgress, setPreRenderProgress] = useState(null);
@@ -343,6 +355,9 @@ export default function PreviewCanvas() {
       actions.addToast("GPU cache pre-rendering complete!", "success");
     } catch (err) {
       console.error(err);
+      frames.forEach(f => {
+        if (f && f.close) f.close();
+      });
       actions.addToast(`Pre-rendering failed: ${err.message}`, "error");
     } finally {
       setPreRenderProgress(null);
@@ -512,6 +527,24 @@ export default function PreviewCanvas() {
         }
       });
 
+      // Re-sync clip playback each frame so voices and b-roll hand off
+      // cleanly when the playhead crosses a block boundary.
+      syncAudioPlayback(
+        elapsed,
+        true,
+        stateRef.current.tracks
+          .filter(t => t.type === 'audio')
+          .flatMap(t => t.clips)
+      );
+      syncVideoPlayback(
+        elapsed,
+        true,
+        stateRef.current.tracks
+          .filter(t => t.type === 'video' || t.type === 'broll' || t.type === 'window')
+          .flatMap(t => t.clips)
+          .filter(c => c.type === 'video')
+      );
+
       playbackAnimFrameRef.current = requestAnimationFrame(tick);
     };
     
@@ -526,7 +559,7 @@ export default function PreviewCanvas() {
         actions.setCurrentTime(Math.min(stateRef.current.totalDuration, elapsed));
       }
     };
-  }, [state.isPlaying]);
+  }, [state.isPlaying, syncAudioPlayback, syncVideoPlayback]);
 
   // Direct DOM listener for the preview time label to run smoothly at 60 FPS
   useEffect(() => {
@@ -1610,9 +1643,9 @@ export default function PreviewCanvas() {
               } else {
                 // Add to PIP/B-Roll Track as vector graphic overlay
                 let targetTrack = state.tracks.find(t => t.type === 'broll' || t.type === 'video');
-                if (!targetTrack) {
-                  actions.addTrack('broll', 'PIP Overlay Track');
-                  targetTrack = state.tracks[state.tracks.length - 1];
+                let targetTrackId = targetTrack?.id;
+                if (!targetTrackId) {
+                  targetTrackId = actions.addTrack('broll', 'PIP Overlay Track');
                 }
                 const newClip = {
                   id: `clip_${Date.now()}_${uid()}`,
@@ -1625,8 +1658,8 @@ export default function PreviewCanvas() {
                   type: 'image',
                   isVector: true,
                 };
-                if (targetTrack) {
-                  actions.addClipToTrack(targetTrack.id, newClip);
+                if (targetTrackId) {
+                  actions.addClipToTrack(targetTrackId, newClip);
                   actions.addToast(`Added "${item.name}" overlay to canvas!`, 'success');
                 }
               }

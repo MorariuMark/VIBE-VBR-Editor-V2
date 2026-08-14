@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 export default function VoiceCloneWindow() {
   const [serverOnline, setServerOnline] = useState(false);
   const [modelLoaded, setModelLoaded] = useState(false);
+  const [transcriberLoaded, setTranscriberLoaded] = useState(false);
   const [serverStatus, setServerStatus] = useState('Checking...');
   const [gpuName, setGpuName] = useState('Detecting...');
   const [vramTotal, setVramTotal] = useState(null); // GB, null = unknown
@@ -26,6 +27,11 @@ export default function VoiceCloneWindow() {
   const [gpuLayers, setGpuLayers] = useState(-1); // -1 = auto
   const [codecCpu, setCodecCpu] = useState(false);
   const [s2Backend, setS2Backend] = useState('auto'); // auto | cpu | cuda | vulkan
+
+  // Longform voiceover mode: 'merged' reads the whole script as ONE
+  // continuous audio track (single S2 run), 'perline' generates one clip
+  // per dialogue line (no length limit, can be slower).
+  const [voiceoverMode, setVoiceoverMode] = useState('merged'); // 'merged' | 'perline'
 
   // Redo mode states
   const [redoBlockId, setRedoBlockId] = useState(null);
@@ -169,16 +175,17 @@ export default function VoiceCloneWindow() {
           setCharacters(state.characters || []);
           setProjectScriptText(state.scriptText || '');
           
-          // Never allow empty/blank lines in the script order preview: blocks
-          // without script text — and longform fallback blocks whose text was
-          // derived from an image filename (scriptMatched === false) — are
-          // dropped entirely, so only text from the script box ever reaches
-          // the AI and image names can never sneak into the narration.
+          // Never allow empty/blank lines in the script order preview. Blocks
+          // without script text are dropped. Longform fallback blocks
+          // (scriptMatched === false) carry the image filename as text: under
+          // the "<index> <whole phrase from the script>.png" naming convention
+          // that phrase IS narration, so they are kept — only keyword
+          // fragments from the old "___" convention are excluded.
           const sanitizeBlocks = (blocks) => (blocks || [])
             .filter(b => {
               const text = (b.text || '').trim();
               if (!text) return false;
-              if (b.scriptMatched === false) return false;
+              if (b.scriptMatched === false && /_{3,}|-{3,}/.test(text)) return false;
               return true;
             });
 
@@ -271,6 +278,43 @@ export default function VoiceCloneWindow() {
             return next;
           });
         }
+
+        // Default character presets: when the project has no characters yet
+        // (fresh short-form project, or long-form before the timeline is
+        // built), seed the window with the built-in Peter & Stewie presets
+        // so their voices are always selectable from the dropdowns in both
+        // content modes.
+        if (activeCharacters.length === 0) {
+          const voiceByName = {};
+          (defaultList || []).forEach(v => { voiceByName[v.name.toLowerCase()] = v; });
+          const seeds = [
+            { id: 'char_stewie', name: 'Stewie', color: '#ff4081' },
+            { id: 'char_peter', name: 'Peter', color: '#448aff' },
+          ];
+          setCharacters(seeds.map(s => ({
+            id: s.id,
+            name: s.name,
+            color: s.color,
+            colorIndex: 0,
+            asset: null,
+            textStyle: {},
+          })));
+          setVoiceConfigs(prev => {
+            const next = { ...prev };
+            seeds.forEach(s => {
+              const voice = voiceByName[s.name.toLowerCase()];
+              if (voice) {
+                next[s.id] = {
+                  type: 'default',
+                  refPath: voice.path,
+                  refText: voice.transcript,
+                  presetName: voice.name,
+                };
+              }
+            });
+            return next;
+          });
+        }
       }
     };
 
@@ -293,6 +337,7 @@ export default function VoiceCloneWindow() {
           const data = await res.json();
           setServerOnline(true);
           setModelLoaded(data.model_loaded);
+          setTranscriberLoaded(!!data.transcriber_loaded);
           if (data.model_loaded && data.model_type) {
             setSelectedModel(prev => {
               if (prev !== data.model_type) {
@@ -435,6 +480,7 @@ export default function VoiceCloneWindow() {
       const data = await res.json();
       if (data.success) {
         setModelLoaded(false);
+        setTranscriberLoaded(false);
         addLog('System: Model unloaded. GPU VRAM cleared.');
       } else {
         addLog(`System Error: ${data.error}`);
@@ -938,17 +984,20 @@ export default function VoiceCloneWindow() {
 
       // Single Voiceover Mode (longform): the WHOLE script box text is read in
       // one go and synthesized as ONE continuous audio file instead of one
-      // track per timeline block. Only blocks whose text comes from the
-      // script box are counted — longform fallback blocks (scriptMatched ===
-      // false) hold image filenames as text and are always excluded.
+      // track per timeline block. It reads the script box (or the block
+      // texts), so it works even when no image phrase matched the script yet
+      // — the caption↔image sync aligns the images after the voiceover.
       const isLongform = dialogueBlocks.some(b => b.imageId || b.imageName);
-      const scriptBlocks = dialogueBlocks.filter(b => b.scriptMatched !== false && (b.text || '').trim());
-      const useSingleVoiceover = !redoBlockId && isLongform && scriptBlocks.length > 0;
+      const scriptBlocks = dialogueBlocks.filter(b => (b.text || '').trim());
+      const hasScriptText = !!(projectScriptText || '').trim();
+      // Merged single voiceover is now an OPTION ('merged' mode). Per-line
+      // generation ('perline' mode) is always available and never truncates.
+      const useSingleVoiceover = !redoBlockId && isLongform && (scriptBlocks.length > 0 || hasScriptText) && voiceoverMode === 'merged';
 
       if (useSingleVoiceover) {
         const mergedText = buildMergedScriptText();
 
-        const firstBlock = scriptBlocks[0];
+        const firstBlock = dialogueBlocks[0] || scriptBlocks[0];
         const config = voiceConfigs[firstBlock.characterId] || Object.values(voiceConfigs).find(c => c && c.refPath) || Object.values(voiceConfigs)[0];
         if (!config || !config.refPath) {
           throw new Error(`No reference audio file assigned for '${firstBlock.characterName || 'Narrator'}'. Please select a voice source.`);
@@ -979,7 +1028,12 @@ export default function VoiceCloneWindow() {
           bodyPayload.model_name = 's2pro';
           bodyPayload.top_p = topP;
           bodyPayload.top_k = topK;
-          bodyPayload.max_tokens = maxTokens;
+          // A single S2 run is capped by max_tokens (~22 speech tokens/sec).
+          // Auto-scale for long merged scripts so audio never truncates at
+          // the 1024-token default (~47s); the user's manual value is used
+          // for per-line clips.
+          const estTokens = Math.ceil((mergedText.length || 0) * 1.8);
+          bodyPayload.max_tokens = Math.min(8192, Math.max(maxTokens, estTokens));
           bodyPayload.gpu_layers = gpuLayers;
           bodyPayload.codec_cpu = codecCpu;
           bodyPayload.s2_backend = s2Backend;
@@ -1040,9 +1094,9 @@ export default function VoiceCloneWindow() {
         const charName = sanitizeFilename(block.characterName || 'character');
         const savePath = `${voicesDir}/voice_${i + 1}_${charName}.wav`;
 
-        const lineText = (block.text || '').trim();
-        if (!lineText || block.scriptMatched === false) {
-          addLog(`System: Skipping line ${i + 1} — no script text to synthesize (${block.imageName || block.characterName || 'empty line'}).`);
+        const lineText = normalizeSpeakText(block.text);
+        if (!lineText || (block.scriptMatched === false && /_{3,}|-{3,}/.test(block.text || ''))) {
+          addLog(`System: Skipping line ${i + 1} — no narration text to synthesize (${block.imageName || block.characterName || 'empty line'}).`);
           continue;
         }
 
@@ -1146,16 +1200,22 @@ export default function VoiceCloneWindow() {
   // Single Voiceover Mode detection (longform): the script order preview shows
   // the WHOLE script as ONE line, and generation synthesizes a single audio
   // file. Only blocks whose text comes from the script box count — longform
-  // fallback blocks (scriptMatched === false) hold image filenames and are
-  // never narrated.
   const isLongformProject = dialogueBlocks.some(b => b.imageId || b.imageName);
-  const scriptOnlyBlocks = dialogueBlocks.filter(b => b.scriptMatched !== false && (b.text || '').trim());
-  const mergedPreviewActive = !redoBlockId && isLongformProject && scriptOnlyBlocks.length > 0;
+  const scriptOnlyBlocks = dialogueBlocks.filter(b => (b.text || '').trim());
+  const mergedPreviewActive = !redoBlockId && isLongformProject && dialogueBlocks.length > 0 && voiceoverMode === 'merged';
 
   // The single line to narrate: always prefer the EXACT script box content
   // (that is the only text the AI may read), with "**Speaker:**" headers
   // stripped so headers never get spoken. Falls back to stitching the
   // script-matched block texts together when no script box content exists.
+  //
+  // Filenames under the "<index> <whole phrase>.png" convention store the
+  // narration with underscores instead of spaces — normalize them so the
+  // TTS reads real words, never "line_42".
+  const normalizeSpeakText = (t) => String(t || '')
+    .replace(/_+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   const buildMergedScriptText = () => {
     const rawFull = (projectScriptText || '').trim();
     if (rawFull) {
@@ -1169,7 +1229,7 @@ export default function VoiceCloneWindow() {
       }
     }
     return scriptOnlyBlocks
-      .map(b => (b.text || '').trim())
+      .map(b => normalizeSpeakText(b.text))
       .filter(Boolean)
       .map(t => (/[.?!…]$/.test(t) ? t : t + '.'))
       .join(' ');
@@ -1688,8 +1748,8 @@ export default function VoiceCloneWindow() {
               </div>
 
               <div className="status-indicator">
-                <span className={`dot ${modelLoaded ? 'dot--green' : 'dot--yellow'}`} style={{ width: 6, height: 6 }}></span>
-                <span>VRAM: <strong>{modelLoaded ? 'Loaded' : 'Free'}</strong></span>
+                <span className={`dot ${(modelLoaded || transcriberLoaded) ? 'dot--green' : 'dot--yellow'}`} style={{ width: 6, height: 6 }}></span>
+                <span>VRAM: <strong>{(modelLoaded || transcriberLoaded) ? 'Loaded' : 'Free'}</strong></span>
               </div>
 
               <label
@@ -1709,7 +1769,7 @@ export default function VoiceCloneWindow() {
                 Auto-Unload
               </label>
 
-              {modelLoaded ? (
+              {(modelLoaded || transcriberLoaded) ? (
                 <button className="btn btn--secondary" style={{ padding: '2px 6px', fontSize: '10px' }} onClick={handleUnloadModel} disabled={unloadingModel || generating}>
                   {unloadingModel ? 'Release...' : 'Release VRAM'}
                 </button>
@@ -1780,7 +1840,7 @@ export default function VoiceCloneWindow() {
                         disabled={generating}
                       >
                         {defaultVoices.map(v => (
-                          <option key={v.name} value={v.name}>{v.name}</option>
+                          <option key={v.name} value={v.name}>{v.name.charAt(0).toUpperCase() + v.name.slice(1)}</option>
                         ))}
                       </select>
                     </div>
@@ -2027,13 +2087,13 @@ export default function VoiceCloneWindow() {
                     type="number"
                     className="form-control input-number"
                     min="64"
-                    max="2048"
+                    max="8192"
                     step="64"
                     value={maxTokens}
                     onChange={(e) => {
                       let val = parseInt(e.target.value, 10);
                       if (isNaN(val)) return;
-                      val = Math.max(64, Math.min(2048, val));
+                      val = Math.max(64, Math.min(8192, val));
                       setMaxTokens(val);
                     }}
                     style={{ width: '110px', padding: '4px 6px', textAlign: 'center' }}
@@ -2220,6 +2280,22 @@ export default function VoiceCloneWindow() {
               </button>
             </div>
           ) : (
+            <>
+            {isLongformProject && dialogueBlocks.length > 0 && !redoBlockId && (
+              <div className="form-row" style={{ justifyContent: 'space-between', margin: '0 0 8px' }}>
+                <span style={{ color: '#a0a0b0', minWidth: 110 }}>Voiceover mode:</span>
+                <select
+                  className="form-control"
+                  value={voiceoverMode}
+                  onChange={(e) => { setVoiceoverMode(e.target.value); setGeneratedResult(null); }}
+                  disabled={generating}
+                  style={{ width: '200px', flex: 'none' }}
+                >
+                  <option value="merged">Single continuous track</option>
+                  <option value="perline">Individual clip per line</option>
+                </select>
+              </div>
+            )}
             <button
               className="btn btn--accent"
               style={{ width: '100%', padding: '12px', fontSize: '14px', fontWeight: 'bold', marginBottom: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
@@ -2238,6 +2314,7 @@ export default function VoiceCloneWindow() {
                 </>
               )}
             </button>
+            </>
           )}
 
           {/* System Operations Log (Enlarged - fills remaining space) */}

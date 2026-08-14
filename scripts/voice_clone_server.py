@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 import time
+import math
 import gc
 import glob
 import subprocess
@@ -33,6 +34,7 @@ os.makedirs(cache_dir, exist_ok=True)
 
 import hashlib
 import json
+import re
 
 # ─── Fast startup helpers ────────────────────────────────────
 # torch import + CUDA detection take seconds, and scan_installed_models()
@@ -90,6 +92,7 @@ def status():
         "status": "active",
         "cuda_available": _gpu_info["cuda_available"],
         "model_loaded": model is not None or model_type == "s2pro",
+        "transcriber_loaded": transcriber is not None,
         "model_type": model_type,
         "gpu_name": _gpu_info["gpu_name"],
         "vram_total": _gpu_info["vram_total"],
@@ -137,8 +140,11 @@ def bump_cancel():
     if proc is not None:
         try:
             proc.kill()
-        except Exception:
-            pass
+            print("[Python Server] S2 subprocess kill signal sent.", flush=True)
+        except Exception as e:
+            print(f"[Python Server] S2 subprocess kill failed: {type(e).__name__}: {e}", flush=True)
+    else:
+        print("[Python Server] No active S2 subprocess to kill (token bumped only).", flush=True)
 
 def check_cancel(token):
     with gen_lock:
@@ -743,20 +749,30 @@ def load_model():
 
 @app.route("/unload", methods=["POST"])
 def unload_model():
-    global model, model_type
+    global model, model_type, transcriber
     try:
         import torch
+        freed = []
         if model is not None:
             print(f"[Python Server] Unloading {model_type} model...", flush=True)
             del model
             model = None
             model_type = None
+            freed.append("model")
+        # The STT transcriber (Whisper) also holds VRAM after any
+        # transcription — release it too so "Release VRAM" really frees VRAM.
+        if transcriber is not None:
+            print("[Python Server] Unloading Whisper transcriber...", flush=True)
+            del transcriber
+            transcriber = None
+            freed.append("transcriber")
+        if freed:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            print("[Python Server] Model unloaded and VRAM cleared.", flush=True)
-            return jsonify({"success": True, "message": "Model unloaded and VRAM cleared"})
-        return jsonify({"success": True, "message": "Model was not loaded"})
+            print(f"[Python Server] Unloaded {', '.join(freed)} and cleared VRAM.", flush=True)
+            return jsonify({"success": True, "message": f"Unloaded {', '.join(freed)} and cleared VRAM", "freed": freed})
+        return jsonify({"success": True, "message": "Nothing loaded to unload"})
     except Exception as e:
         print(f"[Python Server] Failed to unload model: {str(e)}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
@@ -857,10 +873,40 @@ def reset_server():
         print(f"[Python Server] Reset failed: {str(e)}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+def split_script_segments(text, max_chars=900):
+    """Split a long script into sentence-aligned segments for chunked S2 runs.
+
+    One S2 generation is a single autoregressive run: very long scripts make
+    the run slow enough to hit the 900s timeout. Splitting on sentence
+    boundaries (~max_chars per segment) keeps each run fast; the audio is
+    concatenated afterward and the full clip re-transcribed, so the caller
+    still gets one continuous track with whole-script word timings.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    sentences = re.split(r"(?<=[.!?…])\s+", text)
+    segments = []
+    current = ""
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        if current and len(current) + len(sent) + 1 > max_chars:
+            segments.append(current)
+            current = sent
+        else:
+            current = f"{current} {sent}".strip()
+    if current:
+        segments.append(current)
+    return segments
+
 @app.route("/clone", methods=["POST"])
 def clone_voice():
-    global model, model_type
-    
+    global model, model_type, current_s2_proc
+
     data = request.json or {}
     requested_model = data.get("model_name", "luxtts")
 
@@ -1011,20 +1057,6 @@ def clone_voice():
                 return jsonify({"success": False, "error": "S2 Pro model files are missing. Download the model first."}), 500
             
             file_id = str(uuid.uuid4())
-            out_wav = os.path.join(temp_dir, f"s2_{file_id}.wav")
-            
-            cmd = [
-                s2_binary,
-                "--model", model_file,
-                "--tokenizer", tokenizer_file,
-                "--prompt-audio", ref_audio,
-                "--text", text,
-                "--output", out_wav,
-            ]
-            if ref_text and ref_text.strip():
-                cmd += ["--prompt-text", ref_text]
-            else:
-                return jsonify({"success": False, "error": "S2 Pro requires a reference transcript (ref_text). Use a default preset voice or provide one for the custom reference clip."}), 400
 
             # Backend: explicit user choice, else auto-detect from what this
             # particular s2 build actually supports (CUDA/Vulkan/CPU).
@@ -1051,67 +1083,108 @@ def clone_voice():
                 else:
                     backend_flag = []  # CPU-only build
                     print("[Python Server] WARNING: s2 engine built without GPU support (no CUDA/Vulkan). Falling back to CPU + system RAM. Rebuild s2.cpp with a GPU backend for acceleration.", flush=True)
-            cmd += backend_flag
             resp_extra["s2_backend_used"] = backend_used
 
+            base_cmd = [
+                s2_binary,
+                "--model", model_file,
+                "--tokenizer", tokenizer_file,
+                "--prompt-audio", ref_audio,
+            ]
+            base_cmd += backend_flag
+            if ref_text and ref_text.strip():
+                base_cmd += ["--prompt-text", ref_text]
+            else:
+                return jsonify({"success": False, "error": "S2 Pro requires a reference transcript (ref_text). Use a default preset voice or provide one for the custom reference clip."}), 400
+
             if temperature is not None:
-                cmd += ["--temperature", str(float(temperature))]
+                base_cmd += ["--temperature", str(float(temperature))]
             if data.get("top_p") is not None:
-                cmd += ["--top-p", str(float(data["top_p"]))]
+                base_cmd += ["--top-p", str(float(data["top_p"]))]
             if data.get("top_k") is not None:
-                cmd += ["--top-k", str(int(data["top_k"]))]
+                base_cmd += ["--top-k", str(int(data["top_k"]))]
             if data.get("max_tokens") is not None:
-                cmd += ["--max-tokens", str(int(data["max_tokens"]))]
+                base_cmd += ["--max-tokens", str(int(data["max_tokens"]))]
             gpu_layers = data.get("gpu_layers")
             if backend_flag and gpu_layers is not None and float(gpu_layers) >= 0:
-                cmd += ["--gpu-layers", str(int(float(gpu_layers)))]
+                base_cmd += ["--gpu-layers", str(int(float(gpu_layers)))]
             if data.get("codec_cpu"):
-                cmd += ["--codec-cpu"]
-            
-            print(f"[Python Server] Running s2.cpp: {' '.join(cmd)}", flush=True)
-            proc_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=proc_flags,
-                env=s2_subprocess_env(),
-            )
-            with gen_lock:
-                current_s2_proc = proc
-            try:
-                try:
-                    proc_out, proc_err = proc.communicate(timeout=900)
-                except subprocess.TimeoutExpired:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    proc_out, proc_err = proc.communicate()
-                    if check_cancel(gen_token):
-                        print("[Python Server] s2.cpp terminated by cancel.", flush=True)
-                        return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
-                    return jsonify({"success": False, "error": "s2.cpp timed out after 900s"}), 500
-            finally:
+                base_cmd += ["--codec-cpu"]
+
+            # Long scripts are split into sentence-aligned segments so each S2
+            # run stays fast (a single run can exceed the 900s timeout on long
+            # merged voiceovers). Segments are concatenated below and the full
+            # clip is re-transcribed, preserving whole-script word timings.
+            segments = split_script_segments(text, max_chars=900)
+            if not segments:
+                return jsonify({"success": False, "error": "No text to synthesize."}), 400
+            segment_count = len(segments)
+            if segment_count > 1:
+                print(f"[Python Server] Long text ({len(text)} chars): splitting into {segment_count} S2 segments (~900 chars each).", flush=True)
+
+            audio_parts = []
+            target_sr = None
+            for seg_idx, seg_text in enumerate(segments):
+                if check_cancel(gen_token):
+                    print("[Python Server] Generation cancelled between S2 segments.", flush=True)
+                    return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+                seg_out = os.path.join(temp_dir, f"s2_{file_id}_{seg_idx}.wav")
+                cmd = list(base_cmd) + ["--text", seg_text, "--output", seg_out]
+                if segment_count > 1:
+                    print(f"[Python Server] S2 segment {seg_idx + 1}/{segment_count} ({len(seg_text)} chars)...", flush=True)
+                print(f"[Python Server] Running s2.cpp: {' '.join(cmd)}", flush=True)
+                proc_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=proc_flags,
+                    env=s2_subprocess_env(),
+                )
                 with gen_lock:
-                    if current_s2_proc is proc:
-                        current_s2_proc = None
-            if check_cancel(gen_token):
-                print("[Python Server] s2.cpp finished but generation was cancelled.", flush=True)
-                return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
-            if proc.returncode != 0:
-                detail = (proc_err or proc_out or "").strip()
-                tail = detail.splitlines()[-3:] if detail else []
-                return jsonify({"success": False, "error": f"s2.cpp failed (exit {proc.returncode}): {' | '.join(tail)}"}), 500
-            
-            audio_data, sr = sf.read(out_wav)
-            try:
-                os.remove(out_wav)
-            except OSError:
-                pass
+                    current_s2_proc = proc
+                try:
+                    try:
+                        proc_out, proc_err = proc.communicate(timeout=900)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        proc_out, proc_err = proc.communicate()
+                        if check_cancel(gen_token):
+                            print("[Python Server] s2.cpp terminated by cancel.", flush=True)
+                            return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+                        return jsonify({"success": False, "error": f"s2.cpp timed out after 900s (segment {seg_idx + 1}/{segment_count})"}), 500
+                finally:
+                    with gen_lock:
+                        if current_s2_proc is proc:
+                            current_s2_proc = None
+                if check_cancel(gen_token):
+                    print("[Python Server] s2.cpp finished but generation was cancelled.", flush=True)
+                    return jsonify({"success": False, "cancelled": True, "error": "Generation cancelled by user"})
+                if proc.returncode != 0:
+                    detail = (proc_err or proc_out or "").strip()
+                    tail = detail.splitlines()[-3:] if detail else []
+                    return jsonify({"success": False, "error": f"s2.cpp failed (exit {proc.returncode}) on segment {seg_idx + 1}/{segment_count}: {' | '.join(tail)}"}), 500
+
+                seg_audio, seg_sr = sf.read(seg_out)
+                try:
+                    os.remove(seg_out)
+                except OSError:
+                    pass
+                if target_sr is None:
+                    target_sr = seg_sr
+                if audio_parts:
+                    # Small natural pause between segments
+                    audio_parts.append(np.zeros(int(target_sr * 0.12), dtype=seg_audio.dtype))
+                audio_parts.append(seg_audio)
+
+            audio_data = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
+            sr = target_sr
         else: # luxtts
             # Encode reference prompt
             encoded_prompt = model.encode_prompt(ref_audio, prompt_text=ref_text)
@@ -1151,30 +1224,32 @@ def clone_voice():
         # Transcribe audio for word-level timestamps
         words = []
         try:
-            active_transcriber = None
-            if model_type == "luxtts" and hasattr(model, "transcriber"):
-                active_transcriber = model.transcriber
-            else:
-                global transcriber
-                if transcriber is None:
-                    trans_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-                    print(f"[Python Server] Loading local Whisper transcriber for Qwen3...", flush=True)
-                    from transformers import pipeline
-                    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=trans_device)
-                active_transcriber = transcriber
+            is_luxtts_transcriber = (
+                model_type == "luxtts"
+                and hasattr(model, "transcriber")
+                and model.transcriber is not None
+            )
+            active_transcriber = model.transcriber if is_luxtts_transcriber else _get_transcriber()
 
             if active_transcriber is not None:
-                transcription_result = active_transcriber(wav_path, return_timestamps="word")
-                for chunk in transcription_result.get("chunks", []):
-                    if check_cancel(gen_token):
-                        break
-                    ts = chunk.get("timestamp")
-                    if ts is not None and ts[0] is not None and ts[1] is not None:
-                        words.append({
-                            "text": chunk.get("text", "").strip(),
-                            "start": float(ts[0]),
-                            "end": float(ts[1])
-                        })
+                if is_luxtts_transcriber:
+                    # luxtts-specific transcriber: file-path based interface
+                    transcription_result = active_transcriber(wav_path, return_timestamps="word")
+                    for chunk in transcription_result.get("chunks", []):
+                        if check_cancel(gen_token):
+                            break
+                        ts = chunk.get("timestamp")
+                        if ts is not None and ts[0] is not None and ts[1] is not None:
+                            words.append({
+                                "text": chunk.get("text", "").strip(),
+                                "start": float(ts[0]),
+                                "end": float(ts[1])
+                            })
+                else:
+                    # Standard Whisper pipeline: chunked into ~30s slices with
+                    # cancel checks between slices, so a long transcription
+                    # can be interrupted promptly.
+                    words = _transcribe_words(wav_path, gen_token=gen_token)
                 print(f"[Python Server] Transcribed {len(words)} word timestamps.", flush=True)
         except Exception as trans_err:
             traceback.print_exc()
@@ -1210,6 +1285,100 @@ def clone_voice():
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         dec_busy()
+
+def _get_transcriber():
+    """Lazy-load (once) the local Whisper transcriber for word-level STT."""
+    global transcriber
+    if transcriber is None:
+        import torch
+        trans_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        print(f"[Python Server] Loading local Whisper transcriber for STT (device: {trans_device})...", flush=True)
+        from transformers import pipeline
+        transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=trans_device)
+    return transcriber
+
+def _load_audio_array(wav_path, target_sr=16000):
+    """Read a wav into a mono float32 numpy array resampled to target_sr.
+
+    Passed to the transformers ASR pipeline as a numpy array, so no ffmpeg
+    binary is needed to load audio from a filename (the pipeline otherwise
+    requires ffmpeg and assumes arrays are already at the feature
+    extractor's sampling rate)."""
+    import numpy as np
+    import torch
+    import torchaudio
+    audio, sr = torchaudio.load(wav_path)
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    if int(sr) != int(target_sr):
+        audio = torchaudio.functional.resample(audio, int(sr), int(target_sr))
+    return np.ascontiguousarray(audio.squeeze(0).numpy(), dtype=np.float32), int(target_sr)
+
+def _transcribe_words(wav_path, gen_token=None):
+    """STT a wav file with Whisper, returning [{text,start,end}] word timestamps.
+
+    The audio is loaded with torchaudio and passed to the pipeline as a numpy
+    array at the transcriber's sampling rate, so transcription works even
+    when ffmpeg is not on PATH.
+
+    Long clips are transcribed in ~30s slices with a cancel check between
+    slices, so cancelling a generation during transcription responds
+    promptly instead of waiting for one giant pipeline call to finish."""
+    active_transcriber = _get_transcriber()
+    words = []
+    if active_transcriber is not None:
+        target_sr = getattr(getattr(active_transcriber, "feature_extractor", None), "sampling_rate", 16000)
+        audio, sr = _load_audio_array(wav_path, target_sr)
+        chunk_sr = int(target_sr)
+        slice_len = 30 * chunk_sr
+        n_slices = max(1, int(math.ceil(len(audio) / slice_len)))
+        for si in range(n_slices):
+            if gen_token is not None and check_cancel(gen_token):
+                print(f"[Python Server] Transcription cancelled (slice {si + 1}/{n_slices}).", flush=True)
+                return []
+            seg = audio[si * slice_len:(si + 1) * slice_len]
+            seg_offset = si * 30.0
+            transcription_result = active_transcriber(seg, return_timestamps="word")
+            for chunk in transcription_result.get("chunks", []):
+                ts = chunk.get("timestamp")
+                if ts is not None and ts[0] is not None and ts[1] is not None:
+                    words.append({
+                        "text": chunk.get("text", "").strip(),
+                        "start": float(ts[0]) + seg_offset,
+                        "end": float(ts[1]) + seg_offset
+                    })
+    return words
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe_audio():
+    """STT an existing audio file for accurate, word-synced captions.
+
+    Called by the editor when a voiceover is applied to the timeline: the
+    actual applied audio is re-transcribed and the word timestamps are used
+    to drive the captions so they always match what is heard.
+    """
+    try:
+        data = request.json or {}
+        wav_path = data.get("wav_path", "")
+        if not wav_path or not os.path.exists(wav_path):
+            return jsonify({"success": False, "error": "Audio file not found."}), 400
+
+        print(f"[Python Server] STT transcribing {os.path.basename(wav_path)} for captions...", flush=True)
+        words = _transcribe_words(wav_path)
+
+        duration = 0.0
+        try:
+            audio, sr = sf.read(wav_path)
+            duration = len(audio) / sr
+        except Exception as e:
+            print(f"[Python Server] Could not read duration for {wav_path}: {str(e)}", flush=True)
+
+        print(f"[Python Server] STT done: {len(words)} word timestamps, {duration:.2f}s.", flush=True)
+        return jsonify({"success": True, "duration": duration, "words": words})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[Python Server] Transcribe failed: {str(e)}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/concatenate", methods=["POST"])
 def concatenate_voices():

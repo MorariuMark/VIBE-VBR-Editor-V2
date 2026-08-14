@@ -28,6 +28,20 @@ export function tokenize(text) {
     .filter(Boolean);
 }
 
+// Shared by the image matcher and the caption-image sync engine so fuzzy
+// word comparison stays consistent everywhere.
+export function wordsSimilar(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const na = numericOf(a);
+  const nb = numericOf(b);
+  if (na !== null && nb !== null && na === nb) return true;
+  if (a.length < 3 || b.length < 3) return false;
+  if (Math.abs(a.length - b.length) > 2) return false;
+  if (a.length >= 5 && b.length >= 5 && (a.startsWith(b.slice(0, 4)) || b.startsWith(a.slice(0, 4)))) return true;
+  return levenshtein(a, b) <= (Math.max(a.length, b.length) >= 8 ? 2 : 1);
+}
+
 export function splitImageNamePhrases(fileName) {
   const base = String(fileName || '').replace(/\.[^.]+$/, '');
   const parts = base.split(/_{3,}|-{3,}/).map(p => p.trim()).filter(Boolean);
@@ -70,18 +84,6 @@ function numericOf(w) {
   return NUMBER_WORDS[w] || null;
 }
 
-function wordsSimilar(a, b) {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  const na = numericOf(a);
-  const nb = numericOf(b);
-  if (na !== null && nb !== null && na === nb) return true;
-  if (a.length < 3 || b.length < 3) return false;
-  if (Math.abs(a.length - b.length) > 2) return false;
-  if (a.length >= 5 && b.length >= 5 && (a.startsWith(b.slice(0, 4)) || b.startsWith(a.slice(0, 4)))) return true;
-  return levenshtein(a, b) <= (Math.max(a.length, b.length) >= 8 ? 2 : 1);
-}
-
 const MAX_GAP = 4; // max unmatched script words allowed between phrase words
 const MAX_PHRASE_SKIPS = 2; // max phrase words allowed to be missing from script
 const MIN_MATCH_FRACTION = 0.6;
@@ -97,7 +99,9 @@ function buildCorpus(blocks) {
   return corpus;
 }
 
-function buildIndex(corpus) {
+// Export: the caption-image sync engine builds its own corpus (with original
+// casing) and needs the same inverted index + greedy forward aligner.
+export function buildIndex(corpus) {
   const index = {};
   corpus.forEach((entry, pos) => {
     (index[entry.text] = index[entry.text] || []).push(pos);
@@ -170,7 +174,10 @@ function extendBounds(phrase, corpus, positions, minPos, maxPos) {
 
   if (positions[0] === -1) {
     const anchor = positions[firstIdx];
-    for (let q = Math.max(minPos, anchor - 8); q < anchor; q++) {
+    // Scan backward from the anchor so the leading stopword is attached to
+    // the CLOSEST occurrence (a forward scan could grab an earlier "the"
+    // belonging to the previous image's phrase).
+    for (let q = anchor - 1; q >= Math.max(minPos, anchor - 8); q--) {
       if (wordsSimilar(corpus[q].text, phrase[0])) {
         positions[0] = q;
         break;
@@ -188,7 +195,7 @@ function extendBounds(phrase, corpus, positions, minPos, maxPos) {
   }
 }
 
-function matchPhrase(phraseText, corpus, index) {
+export function matchPhrase(phraseText, corpus, index, minPos = 0) {
   const phrase = tokenize(phraseText);
   if (phrase.length === 0) return null;
   const n = phrase.length;
@@ -198,16 +205,16 @@ function matchPhrase(phraseText, corpus, index) {
   const anchor = anchorIdx === -1 ? 0 : anchorIdx;
   const candidates = new Set();
 
-  const occ = (index[phrase[anchor]] || []).slice(0, 25);
+  const occ = (index[phrase[anchor]] || []).filter(p => p >= minPos).slice(0, 25);
   occ.forEach(p => candidates.add(p));
   if (anchor !== 0) {
-    (index[phrase[0]] || []).slice(0, 10).forEach(p => candidates.add(p));
+    (index[phrase[0]] || []).filter(p => p >= minPos).slice(0, 10).forEach(p => candidates.add(p));
   }
 
   const preRequired = Math.max(1, Math.ceil(n * 0.4));
   let best = null;
   for (const start of candidates) {
-    const positions = alignForward(phrase, corpus, start, anchor, 0, maxPos);
+    const positions = alignForward(phrase, corpus, start, anchor, minPos, maxPos);
     const res = scoreAlignment(phrase, positions);
     if (res.matches >= preRequired && (!best || res.score > best.score)) {
       best = { ...res, positions };
@@ -215,7 +222,7 @@ function matchPhrase(phraseText, corpus, index) {
   }
 
   if (!best) return null;
-  extendBounds(phrase, corpus, best.positions, 0, maxPos);
+  extendBounds(phrase, corpus, best.positions, minPos, maxPos);
   const finalMatches = best.positions.filter(p => p !== -1).length;
   if (finalMatches < Math.max(1, Math.ceil(n * MIN_MATCH_FRACTION))) return null;
   return best;

@@ -2,6 +2,7 @@ import React, { createContext, useContext, useReducer, useRef } from 'react';
 import { parseScript, recalculateTimings, addCustomCharacter, DEFAULT_TEXT_STYLE, estimateDialogueDuration } from '../engine/scriptParser';
 import { matchImageToScript } from '../utils/scriptImageMatcher';
 import { buildLongFormTimeline, extractImageNumber, stripImageNumber } from '../engine/longFormParser';
+import { syncImageBlocksToCaptions } from '../engine/captionImageSync';
 import { uid } from '../utils/fileHelpers';
 import { alignWords, distributeMergedWords } from '../engine/renderEngine';
 
@@ -97,9 +98,11 @@ const ActionTypes = {
   ADD_MEDIA: 'ADD_MEDIA',
   REMOVE_MEDIA: 'REMOVE_MEDIA',
   RENAME_MEDIA: 'RENAME_MEDIA',
+  UPDATE_MEDIA: 'UPDATE_MEDIA',
   IMPORT_IMAGE_FOLDER: 'IMPORT_IMAGE_FOLDER',
   APPLY_IMAGES_TO_TIMELINE: 'APPLY_IMAGES_TO_TIMELINE',
   BUILD_LONG_FORM_TIMELINE: 'BUILD_LONG_FORM_TIMELINE',
+  SYNC_IMAGE_CAPTIONS: 'SYNC_IMAGE_CAPTIONS',
   SET_PROJECT_MODE: 'SET_PROJECT_MODE',
   RESET_PROJECT: 'RESET_PROJECT',
   SET_AUDIO: 'SET_AUDIO',
@@ -802,6 +805,32 @@ function coreProjectReducer(state, action) {
       };
     }
 
+    case ActionTypes.SYNC_IMAGE_CAPTIONS: {
+      const { mergedWords, anchor } = action.payload || {};
+      const syncedBlocks = syncImageBlocksToCaptions(state.dialogueBlocks, mergedWords, anchor);
+      if (!syncedBlocks || syncedBlocks === state.dialogueBlocks) return state;
+
+      const characterPresenceClips = (state.characterPresenceClips || []).map(clip => {
+        const block = syncedBlocks.find(b => b.id === clip.id.replace('presence_', ''));
+        if (!block) return clip;
+        return { ...clip, startTime: block.startTime, duration: block.duration };
+      });
+      const totalDuration = recalculateTotalDuration(syncedBlocks);
+      const tracks = generateTracksFromBlocks(syncedBlocks, state.characters, {
+        ...state,
+        totalDuration,
+        characterPresenceClips,
+        tracks: state.tracks,
+      });
+      return {
+        ...state,
+        dialogueBlocks: syncedBlocks,
+        characterPresenceClips,
+        tracks,
+        totalDuration,
+      };
+    }
+
     case ActionTypes.RESET_PROJECT: {
       return {
         ...initialState,
@@ -829,6 +858,12 @@ function coreProjectReducer(state, action) {
     case ActionTypes.RENAME_MEDIA: {
       const { id, name } = action.payload;
       const mediaItems = state.mediaItems.map(m => m.id === id ? { ...m, name } : m);
+      return { ...state, mediaItems };
+    }
+
+    case ActionTypes.UPDATE_MEDIA: {
+      const { id, changes } = action.payload;
+      const mediaItems = state.mediaItems.map(m => m.id === id ? { ...m, ...changes } : m);
       return { ...state, mediaItems };
     }
     
@@ -1462,6 +1497,11 @@ function coreProjectReducer(state, action) {
       if (mergedItem && blocks.length > 0) {
         const anchor = mergedItem.startTime != null ? mergedItem.startTime : (blocks[0].startTime || 0);
         blocks = distributeMergedWords(blocks, mergedItem.words, anchor);
+        // Caption ↔ image sync: verify the caption stream against the image
+        // names ("<index> <whole phrase>.png") and re-slice every image block
+        // so each image switches exactly when its phrase ends and the next
+        // image's phrase begins.
+        blocks = syncImageBlocksToCaptions(blocks, mergedItem.words, anchor);
       }
 
       items.forEach(item => {
@@ -1929,9 +1969,11 @@ const UNDOABLE_ACTIONS = new Set([
   'ADD_MEDIA',
   'REMOVE_MEDIA',
   'RENAME_MEDIA',
+  'UPDATE_MEDIA',
   'IMPORT_IMAGE_FOLDER',
   'APPLY_IMAGES_TO_TIMELINE',
   'BUILD_LONG_FORM_TIMELINE',
+  'SYNC_IMAGE_CAPTIONS',
   'SET_PROJECT_MODE',
   'RESET_PROJECT',
   'SET_BACKGROUND_VIDEO',
@@ -1977,6 +2019,7 @@ function getHumanReadableActionName(actionType) {
     IMPORT_IMAGE_FOLDER: 'Import Image Folder',
     APPLY_IMAGES_TO_TIMELINE: 'Apply Images to Timeline',
     BUILD_LONG_FORM_TIMELINE: 'Build Long-Form Timeline',
+    SYNC_IMAGE_CAPTIONS: 'Sync Images to Captions',
     SET_PROJECT_MODE: 'Choose Project Preset',
     RESET_PROJECT: 'New Project',
     SET_AUDIO: 'Set Audio File',
@@ -2483,6 +2526,10 @@ export function ProjectProvider({ children }) {
     renameMedia: ((id, name) => {
       dispatch({ type: ActionTypes.RENAME_MEDIA, payload: { id, name } });
     }),
+
+    updateMedia: ((id, changes) => {
+      dispatch({ type: ActionTypes.UPDATE_MEDIA, payload: { id, changes } });
+    }),
     
     importImageFolder: ((items) => {
       dispatch({ type: ActionTypes.IMPORT_IMAGE_FOLDER, payload: items });
@@ -2648,6 +2695,10 @@ export function ProjectProvider({ children }) {
 
     applyVoices: ((items) => {
       dispatch({ type: ActionTypes.BATCH_APPLY_VOICES, payload: items });
+    }),
+
+    syncImageCaptions: ((mergedWords, anchor) => {
+      dispatch({ type: ActionTypes.SYNC_IMAGE_CAPTIONS, payload: { mergedWords, anchor } });
     }),
 
     setTracks: ((tracks) => {

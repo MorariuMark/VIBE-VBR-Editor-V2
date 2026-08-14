@@ -94,7 +94,8 @@ export default function LongFormInspector({ onMinimize }) {
           />
           <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: 4, lineHeight: 1.4 }}>
             Add <b>**Name:</b> headers to split speakers (optional — plain narration works too). Image files must follow the naming convention:{' '}
-            <b>scene start ___ scene end.png</b>
+            <b>1 <i>whole phrase from the script</i>.png</b>
+            {' '}(e.g. <b>1 The captain orders the crew to abandon ship.png</b>). The number fixes the order; each image stays on screen while its phrase is being spoken.
           </div>
         </div>
 

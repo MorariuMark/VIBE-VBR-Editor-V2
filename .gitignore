@@ -18,6 +18,19 @@ tools/
 s2.cpp/
 build_tmp/
 .pip_cache/
+.pip/
 %TEMP%/
 
+# Generated/stale artifacts
 VIBE-BR-Video Editor/
+*.sqlite
+*.db
+
+# Model/weight binaries (re-downloadable, never committed)
+*.gguf
+*.onnx
+*.pt
+*.bin
+
+# NOTE: media under assets/ and presets/ is intentionally tracked
+# (default character images, reference voices, presets JSON).

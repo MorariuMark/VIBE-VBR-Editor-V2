@@ -1,0 +1,53 @@
+# ── AI / editor context ignore (Cursor, opencode, etc.) ──────────────────
+# Heavy local-only dirs — never read into AI context, never indexed.
+node_modules/
+dist/
+.venv/
+.hf_cache/
+models/
+userData/
+tools/
+s2.cpp/
+build_tmp/
+VIBE-BR-Video Editor/
+
+# Caches & generated files
+.pip_cache/
+.pip/
+*.log
+*.sqlite
+*.db
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.tsbuildinfo
+
+# Binary model/data weights — zero token value, huge byte cost
+*.gguf
+*.onnx
+*.pt
+*.bin
+*.pkl
+*.npy
+
+# Raw media / bundles — binary, never useful as tokens
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.pdf
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.ico
+
+# Media caches (regenerate at runtime)
+presets/media/voice_cache/
+
+# Project-local installs
+%TEMP%/
+install_voice_clone.bat.tmp

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useProject } from '../store/ProjectContext';
 import { getMediaType, readFileAsDataUrl, uid } from '../utils/fileHelpers';
+import { transcribeAudioFile } from '../utils/voiceSTT';
 import HoverMenuItem from './HoverMenuItem';
 
 const getVideoDuration = (dataUrl) => {
@@ -368,7 +369,22 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
     return block;
   };
 
-  const handleAutoApplyVoice = (item) => {
+  const handleAutoApplyVoice = async (item) => {
+    // STT kick-in: if the clip has no word timestamps yet, transcribe the
+    // actual applied audio so captions are accurate and synced.
+    let words = item.words || [];
+    if (words.length === 0 && item.path) {
+      const stt = await transcribeAudioFile(item.path);
+      if (stt && stt.words && stt.words.length > 0) {
+        words = stt.words;
+        actions.updateMedia(item.id, { words, duration: stt.duration || item.duration });
+        if (item.mergedVoiceover) {
+          actions.syncImageCaptions(words, item.startTime != null ? item.startTime : 0);
+        }
+        actions.addToast(`Captions generated via STT for "${item.name}"`, "success");
+      }
+    }
+
     if (item.mergedVoiceover) {
       // Single continuous voiceover: one free-standing clip on the audio
       // track anchored at the first dialogue block, spanning the narration.
@@ -376,7 +392,7 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
       actions.applyVoices([{
         startTime: firstBlock ? firstBlock.startTime : (item.startTime != null ? item.startTime : 0),
         duration: item.duration || 3.0,
-        words: item.words || [],
+        words,
         name: item.name,
         path: item.path,
         dataUrl: item.dataUrl,
@@ -394,7 +410,7 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
     actions.applyVoices([{
       blockId: block.id,
       duration: item.duration || 3.0,
-      words: item.words || [],
+      words,
       name: item.name,
       path: item.path,
       dataUrl: item.dataUrl,
@@ -403,18 +419,33 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
     actions.addToast(`Applied voice to dialogue line of ${block.characterName}!`, "success");
   };
 
-  const handleApplyAllVoices = () => {
+  const handleApplyAllVoices = async () => {
     const voiceItems = state.mediaItems.filter(item => item.isVoiceClone);
     const voicesToApply = [];
-    
-    voiceItems.forEach(item => {
+    let sttCount = 0;
+
+    for (const item of voiceItems) {
+      // STT kick-in for clips without word timestamps (accurate captions).
+      let words = item.words || [];
+      if (words.length === 0 && item.path) {
+        const stt = await transcribeAudioFile(item.path);
+        if (stt && stt.words && stt.words.length > 0) {
+          words = stt.words;
+          actions.updateMedia(item.id, { words, duration: stt.duration || item.duration });
+          if (item.mergedVoiceover) {
+            actions.syncImageCaptions(words, item.startTime != null ? item.startTime : 0);
+          }
+          sttCount++;
+        }
+      }
+
       const block = resolveBlockForVoice(item);
       if (item.mergedVoiceover) {
         const firstBlock = state.dialogueBlocks[0];
         voicesToApply.push({
           startTime: firstBlock ? firstBlock.startTime : (item.startTime != null ? item.startTime : 0),
           duration: item.duration || 3.0,
-          words: item.words || [],
+          words,
           name: item.name,
           path: item.path,
           dataUrl: item.dataUrl,
@@ -423,17 +454,21 @@ export default function MediaLibrary({ onMinimize }) {  const { state, actions, 
         voicesToApply.push({
           blockId: block.id,
           duration: item.duration || 3.0,
-          words: item.words || [],
+          words,
           name: item.name,
           path: item.path,
           dataUrl: item.dataUrl,
         });
       }
-    });
+    }
 
     if (voicesToApply.length === 0) {
       actions.addToast("No matching script dialogue lines found to apply these voice clips to.", "warning");
       return;
+    }
+
+    if (sttCount > 0) {
+      actions.addToast(`STT generated captions for ${sttCount} voice clip(s)`, "success");
     }
 
     actions.applyVoices(voicesToApply);

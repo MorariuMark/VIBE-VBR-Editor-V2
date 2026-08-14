@@ -1,4 +1,5 @@
 import { getAnimatedTransform, getActiveBlocks, getInterpolatedKeyframeTransform } from './animationEngine';
+import { wordsSimilar } from '../utils/scriptImageMatcher';
 
 export function alignWords(scriptWords, whisperWords) {
   if (!scriptWords || scriptWords.length === 0) return [];
@@ -147,12 +148,36 @@ export function distributeMergedWords(blocks, mergedWords, anchorTime = null) {
   const aligned = alignWords(corpus.map(e => e.word), mergedWords);
   if (!aligned || aligned.length !== corpus.length) return blocks;
 
+  // Captions come from the STT stream (what was actually spoken), not the
+  // script text: map each aligned position back to its spoken word.
+  const sttByStart = new Map();
+  mergedWords.forEach((w, idx) => {
+    const key = typeof w.start === 'number' ? w.start : `i${idx}`;
+    if (!sttByStart.has(key)) sttByStart.set(key, w);
+  });
+  const sttTextAt = (a) => {
+    const key = typeof a.start === 'number' ? a.start : null;
+    const w = key != null ? sttByStart.get(key) : undefined;
+    return w && typeof w.text === 'string' && w.text.trim() ? w.text.trim() : (a.text || '');
+  };
+
+  // Guardrail: a block's script words must actually be heard in the caption
+  // stream; otherwise its timestamps are garbage (alignment to unrelated
+  // STT words) and the caption would highlight the wrong words.
+  const normalize = (s) => String(s || '').toLowerCase().replace(/[^\w]/g, '');
+  const verifyEntry = (a) => {
+    const sttTok = normalize(sttTextAt(a));
+    return !sttTok || !normalize(a.text) || wordsSimilar(normalize(a.text), sttTok);
+  };
+
   const base = anchorTime != null ? anchorTime : (blocks[0].startTime || 0);
 
   const perBlock = blocks.map(() => ({
     firstStart: Infinity,
     lastEnd: -Infinity,
     words: [],
+    verified: 0,
+    total: 0,
   }));
 
   aligned.forEach((a, k) => {
@@ -162,7 +187,9 @@ export function distributeMergedWords(blocks, mergedWords, anchorTime = null) {
     const acc = perBlock[blockIdx];
     if (s < acc.firstStart) acc.firstStart = s;
     if (e > acc.lastEnd) acc.lastEnd = e;
-    acc.words.push({ text: a.text, start: s, end: e });
+    acc.total++;
+    if (verifyEntry(a)) acc.verified++;
+    acc.words.push({ text: sttTextAt(a), start: s, end: e });
   });
 
   const trailingPad = 0.4;
@@ -172,7 +199,7 @@ export function distributeMergedWords(blocks, mergedWords, anchorTime = null) {
       return { ...block, words: [], duration: Math.max(0.5, block.duration || 0.5) };
     }
     const acc = perBlock[blockIdx];
-    if (acc.words.length === 0) {
+    if (acc.words.length === 0 || (acc.total > 0 && acc.verified / acc.total < 0.6)) {
       return { ...block, words: [], duration: Math.max(0.5, block.duration || 0.5) };
     }
     const sliceStart = Math.max(0, acc.firstStart);

@@ -12,6 +12,7 @@ import ExportModal from './components/ExportModal';
 import ToastContainer from './components/ToastContainer';
 import AutomationConsole from './components/AutomationConsole';
 import { uid } from './utils/fileHelpers';
+import { transcribeAudioFile } from './utils/voiceSTT';
 
 function AppContent() {
   const { state, actions } = useProject();
@@ -275,6 +276,29 @@ function AppContent() {
 
           // Add to media library only
           actions.addMedia(item);
+
+          // STT kick-in: if this applied voiceover came without word
+          // timestamps (e.g. generation-time transcription failed, or the
+          // clip came from another source), transcribe the actual applied
+          // audio now so captions are always accurate and in sync.
+          if (item.path && (!item.words || item.words.length === 0)) {
+            transcribeAudioFile(item.path).then(result => {
+              if (result && result.words && result.words.length > 0) {
+                actions.updateMedia(item.id, {
+                  words: result.words,
+                  duration: result.duration || item.duration,
+                });
+                if (item.blockId) {
+                  actions.updateBlock(item.blockId, { words: result.words });
+                } else if (item.mergedVoiceover) {
+                  // Continuous narration: re-verify the fresh captions
+                  // against the image file names and re-slice every image
+                  // block so images switch exactly on their phrase bounds.
+                  actions.syncImageCaptions(result.words, item.startTime != null ? item.startTime : 0);
+                }
+              }
+            });
+          }
         }
 
         actions.addToast(`All ${voices.length} voiceover clips added to Media Library!`, 'success');
